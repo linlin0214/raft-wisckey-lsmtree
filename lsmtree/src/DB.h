@@ -1,0 +1,795 @@
+#pragma once
+#include "Arena.h"
+#include "VLogStruct.h"
+#include "skiplist.h"
+#include "WalManager.h"
+#include "SSTableBuilder.h"
+#include "SSTableReader.h"
+#include "Compactor.h"
+#include "Config.h"
+#include "ValueLog.h"
+#include "DataStructrue.h"
+#include "ManifestManager.h"
+#include "LRUCache.h"
+#include "ThreadWrite.h"
+#include "ThreadPool.h"
+#include <cstddef>
+#include <memory>
+#include <vector>
+#include <string>
+#include <filesystem>
+#include <algorithm>
+#include <iostream>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
+#include <cmath>
+#include <deque>
+#include <climits>
+#include <fcntl.h>
+#include <unistd.h>
+#include <random>
+
+static constexpr size_t max_batch_size = 64;
+namespace fs = std::filesystem;
+
+struct ImmContext {
+    std::unique_ptr<Arena> arena;
+    std::unique_ptr<skiplist> mem;
+
+    ImmContext(int max_level = 12) {
+        arena = std::make_unique<Arena>();
+        mem = std::make_unique<skiplist>(max_level, arena.get());
+    }
+};
+
+class DB {
+public:
+    DB(const std::string& db_dir) 
+        : base_dir_([&]() {
+              std::string dir = db_dir;
+              if (!dir.empty() && dir.back() != '/' && dir.back() != '\\') {
+                  dir += "/";
+              }
+              return dir;
+          }()), 
+          arena_(),                     
+          memtable_(12, &arena_),
+          wal_(base_dir_ + "production.wal"), 
+          vlog_(base_dir_ + "vlog_storage"), 
+          manifest_manager_(base_dir_), 
+          high_pri_pool(1), // 铁律 1：Flush 保持单线程，保证 L0 顺序与 WAL 安全
+          low_pri_pool(2),
+          shutting_down_(false),
+          is_compacting_(false),
+          is_gcing_(false),
+          file_id_(0){
+        
+        std::filesystem::create_directories(base_dir_);
+        levels_.resize(config::K_NUM_LEVELS); 
+        manifest_manager_.Recover(levels_);
+
+        int max_id = 0;
+        for (const auto& level : levels_) {
+            for (const auto& r : level) {
+                max_id = std::max(max_id, ExtractId(r->GetFilename()));
+            }
+        }
+        file_id_.store(max_id + 1); 
+
+        wal_.recovery(memtable_); 
+    }
+
+    ~DB() {
+        shutting_down_.store(true);
+        {
+            std::lock_guard<std::mutex> lock(cv_mutex_);
+            put_cv_.notify_all();
+        }
+    }
+
+    void Put(int key, const std::string& value) {
+        // 在当前线程栈上构造 Writer 节点
+        ThreadWrite::Writer w(key,&value);
+        //CAS入栈构建链表
+        thread_write_.JoinBatchGroup(&w);
+        //follower等待
+        if(w.state.load(std::memory_order_acquire)==ThreadWrite::STATE_FOLLOWER){
+            thread_write_.AwaitState(&w,ThreadWrite::STATE_COMPLETE);
+            return ;//leader完成了wal，memtable写入
+        }
+
+        //leader操作批处理
+        std::vector<ThreadWrite::Writer*> batch_group;
+        thread_write_.EnterAsBatchGroupLeader(batch_group);
+
+        //进行vlog写入
+        std::vector<std::string> encode_ptr;
+        encode_ptr.reserve(batch_group.size());
+        {  
+            //只是内存操作
+            std::unique_lock<std::mutex> lock(vlog_mutex_);
+            for (auto writer : batch_group) {
+                VLogPointer vlog_ptr = vlog_.Append(writer->key, *(writer->value));
+                encode_ptr.push_back(vlog_ptr.Encode());
+            }
+        }
+        //wal和memtable
+        {
+            std::unique_lock<std::mutex> lock(rw_mutex_);
+
+            ThreadWrite::WriteBatch batch;
+            batch.entries.reserve(batch_group.size());
+
+            for (size_t i = 0; i < batch_group.size(); ++i) {
+                int k = batch_group[i]->key;
+                const std::string& ptr = encode_ptr[i];
+                //构造wal的batch
+                batch.entries.push_back({k,ptr});
+                //memtable写入
+                memtable_.insert(k,ptr,memtable_.RandomLevel());  
+            }
+            wal_.LogBatch(batch);
+
+            MaybeSwapMemtable(lock);
+        }
+        thread_write_.ExitAsBatchGroupLeader(batch_group);
+    }
+
+    void Delete(int key) {
+        Put(key, config::TOMBSTONE); 
+    }
+
+    std::string Get(int key) {
+        std::unique_lock<std::mutex> lock(rw_mutex_);
+        
+        std::string internal_val = InternalGetPtrNoLock(key);
+        if (internal_val.empty() || internal_val == config::TOMBSTONE) return "NOT_FOUND";
+
+        VLogPointer ptr = VLogPointer::Decode(internal_val);
+        if (ptr.size == 0) return "NOT_FOUND"; 
+
+        std::lock_guard<std::mutex> vlog_lock(vlog_mutex_);
+        return vlog_.Read(ptr); 
+    }
+
+    static void DestroyDB(const std::string& wal_path) {
+        std::error_code ec; 
+        if (std::filesystem::exists(wal_path)) {
+            std::filesystem::remove(wal_path, ec);
+        }
+        std::string vlog_dir = wal_path + "_vlog";
+        if (std::filesystem::exists(vlog_dir)) {
+            std::filesystem::remove_all(vlog_dir, ec);
+        }
+        std::filesystem::path p(wal_path);
+        std::string target_dir = p.has_parent_path() ? p.parent_path().string() : ".";
+        if (std::filesystem::exists(target_dir)) {
+            for (const auto& entry : std::filesystem::directory_iterator(target_dir)) {
+                if (entry.path().extension() == ".sst") {
+                    std::filesystem::remove(entry.path(), ec);
+                }
+            }
+        }
+    }
+
+    std::vector<std::pair<int, std::string>> GetAllKVs() {
+        std::unordered_map<int,std::string> snapshot_map;
+        {
+            std::unique_lock<std::mutex> lock(rw_mutex_);
+
+            for (int l = config::K_NUM_LEVELS - 1; l >= 1; --l) {
+                for (const auto& reader : levels_[l]) {
+                    SSTableIterator it(reader.get());
+                    while (it.Valid()) {
+                        snapshot_map[it.Key()] = it.Value();
+                        it.Next();
+                    }
+                }
+            }
+
+            for (const auto& reader : levels_[0]) {
+                SSTableIterator it(reader.get());
+                while (it.Valid()) {
+                    snapshot_map[it.Key()] = it.Value();
+                    it.Next();
+                }
+            }
+
+            for (auto q_it = imm_queue_.begin(); q_it != imm_queue_.end(); ++q_it) {
+                skiplist::Iterator it = (*q_it)->mem->Begin();
+                while (it.Valid()) {
+                    snapshot_map[it.key()] = it.value();
+                    it.Next();
+                }
+            }
+
+            skiplist::Iterator it = memtable_.Begin();
+            while (it.Valid()) {
+                snapshot_map[it.key()] = it.value();
+                it.Next();
+            }
+        }
+
+        std::vector<std::pair<int, std::string>> result;
+        result.reserve(snapshot_map.size());
+
+        {
+            std::lock_guard<std::mutex> vlog_lock(vlog_mutex_);
+            
+            for (const auto& [k, ptr_str] : snapshot_map) {
+                if (ptr_str == config::TOMBSTONE) {
+                    continue; 
+                }
+
+                VLogPointer ptr = VLogPointer::Decode(ptr_str);
+                if (ptr.size == 0) continue;
+
+                std::string actual_value = vlog_.Read(ptr);
+                result.push_back({k, actual_value});
+            }
+        }
+
+        return result;
+    }
+
+    void PutBatch(const std::vector<std::pair<int, std::string>>& kvs) {
+        if (kvs.empty()) return;
+
+        std::vector<std::pair<int, std::string>> ptr_kvs;
+        ptr_kvs.reserve(kvs.size());
+
+        {
+            std::lock_guard<std::mutex> vlog_lock(vlog_mutex_);
+            for (const auto& [key, value] : kvs) {
+                if (value == config::TOMBSTONE) {
+                    ptr_kvs.push_back({key, config::TOMBSTONE});
+                } else {
+                    VLogPointer ptr = vlog_.Append(key, value);
+                    ptr_kvs.push_back({key, ptr.Encode()});
+                }
+            }
+        }
+
+        {
+            std::unique_lock<std::mutex> lsm_lock(rw_mutex_);
+            for (const auto& [key, encoded_ptr] : ptr_kvs) {
+                memtable_.insert(key, encoded_ptr, memtable_.RandomLevel());
+            }
+            MaybeSwapMemtable(lsm_lock);
+        }
+    }
+
+private:
+    std::string InternalGetPtrNoLock(int key) {
+        auto node = memtable_.search(key); 
+        if (node) return node->GetValue();
+        
+        // 按时间从新到旧，遍历 Immutable MemTable 缓冲队列
+        for (auto it = imm_queue_.rbegin(); it != imm_queue_.rend(); ++it) {
+            auto imm_node = (*it)->mem->search(key);
+            if (imm_node) return imm_node->GetValue();
+        }
+        
+        for (int i = (int)levels_[0].size() - 1; i >= 0; --i) {
+            if (!levels_[0][i]->MightContain(key)) continue;
+            std::string v = levels_[0][i]->Search(key, &lru_cache_); 
+            if (!v.empty()) return v;
+        }
+        
+        for (int l = 1; l < config::K_NUM_LEVELS; ++l) {
+            auto it = std::lower_bound(levels_[l].begin(), levels_[l].end(), key,
+                [](const std::shared_ptr<SSTableReader>& r, int k) { 
+                    return r->GetMaxKey() < k; 
+                });
+            
+            if (it != levels_[l].end() && key >= (*it)->GetMinKey()) {
+                if (!(*it)->MightContain(key)) continue;
+                std::string v = (*it)->Search(key, &lru_cache_);
+                if (!v.empty()) return v;
+            }
+        }
+        return "";
+    }
+
+    void MaybeTriggerCompaction() {
+        if (shutting_down_.load()) return;
+        if (is_compacting_.exchange(true)) return;
+        
+        struct compactionguard {
+            std::atomic<bool>& flag;
+            ~compactionguard() { flag.store(false); }
+        } guard{is_compacting_};
+
+        bool need_compact = false;
+        {
+            std::unique_lock<std::mutex> lock_(rw_mutex_);
+            if (levels_[0].size() >= 4) {
+                need_compact = true;
+            }
+        }
+        if (need_compact) {
+            MajorCompaction();
+        }
+    }
+
+    // 铁律 4：锁外进行 I/O 与大小判定，杜绝在全局写锁内调用 stat 系统调用
+    void MajorCompaction() {
+        bool has_work = true;
+        while (has_work && !shutting_down_.load()) {
+            has_work = false; 
+            for (int i = 0; i < 6; ++i) {
+                std::vector<std::shared_ptr<SSTableReader>> level_snapshot;
+                {
+                    std::unique_lock<std::mutex> lock(rw_mutex_);
+                    level_snapshot = levels_[i];
+                }
+
+                // 锁外统计物理字节，0 阻塞前台
+                size_t current_level_bytes = 0;
+                for (const auto& r : level_snapshot) {
+                    std::error_code ec;
+                    current_level_bytes += std::filesystem::file_size(r->GetFilename(), ec);
+                }
+
+                    // 2. 字节倍增校验 (L1=10MB, L2=100MB, L3=1GB...)
+                bool trigger_compaction = false;
+                if (i == 0) {
+                    if (level_snapshot.size() >= 4) trigger_compaction = true;
+                } else {
+                    size_t threshold_bytes = 10 * 1024 * 1024 * static_cast<size_t>(std::pow(10, i - 1));
+                    if (current_level_bytes >= threshold_bytes) trigger_compaction = true;
+                }
+
+                if (!trigger_compaction) continue; 
+
+                has_work = true; 
+                std::vector<std::shared_ptr<SSTableReader>> inputs_curr;
+                std::vector<std::shared_ptr<SSTableReader>> inputs_next;
+                int min_k = INT_MAX, max_k = INT_MIN;
+
+                {
+                    std::unique_lock<std::mutex> lock(rw_mutex_);
+                    if (i == 0) {
+                        if (levels_[i].size() < 4) continue;
+                        inputs_curr = levels_[i]; 
+                    } else {
+                        // 挑选一半文件沉降，防止 I/O 尖刺
+                        size_t num_to_merge = std::max<size_t>(2, levels_[i].size() / 2);
+                        for (size_t n = 0; n < num_to_merge && n < levels_[i].size(); ++n) {
+                            inputs_curr.push_back(levels_[i][n]);  
+                        }
+                    }
+                    
+                    for (const auto& r : inputs_curr) {
+                        min_k = std::min(min_k, r->GetMinKey());
+                        max_k = std::max(max_k, r->GetMaxKey());
+                    }
+                    
+                    for (const auto& r : levels_[i + 1]) {
+                        if (!(r->GetMaxKey() < min_k || r->GetMinKey() > max_k)) {
+                            inputs_next.push_back(r);
+                        }
+                    }
+                } 
+
+                std::vector<std::shared_ptr<SSTableReader>> all_inputs;
+                if (i == 0) {
+                    std::vector<std::shared_ptr<SSTableReader>> rev_curr = inputs_curr;
+                    std::reverse(rev_curr.begin(), rev_curr.end());
+                    all_inputs = rev_curr;
+                } else {
+                    all_inputs = inputs_curr;
+                }
+                all_inputs.insert(all_inputs.end(), inputs_next.begin(), inputs_next.end());
+
+                std::vector<std::string> new_files;
+                try {
+                    Compactor c;
+                    new_files = c.DoMajorCompaction(base_dir_, all_inputs, i + 1, file_id_, (i + 1 == 6));
+                } catch (const std::exception& e) {
+                    std::cerr << "[Compaction Fatal] 合并过程抛出异常: " << e.what() << std::endl;
+                    continue; 
+                }
+
+                if (new_files.empty() && !all_inputs.empty()) {
+                    continue;
+                }
+
+                VersionEdit edit;
+                for (const auto& r : inputs_curr) edit.DeleteFile(i, ExtractId(r->GetFilename()));
+                for (const auto& r : inputs_next) edit.DeleteFile(i + 1, ExtractId(r->GetFilename()));
+
+                std::vector<std::shared_ptr<SSTableReader>> new_readers;
+                for (const auto& name : new_files) {
+                    auto reader = std::make_shared<SSTableReader>(name);
+                    new_readers.push_back(reader);
+                    std::error_code ec;
+                    size_t fsize = std::filesystem::file_size(name, ec); 
+                    edit.AddFile(i + 1, ExtractId(name), fsize, reader->GetMinKey(), reader->GetMaxKey()); 
+                }
+
+                manifest_manager_.LogAndApply(edit);
+
+                {
+                    std::unique_lock<std::mutex> lock(rw_mutex_);
+                    auto& lv_curr = levels_[i];
+                    lv_curr.erase(std::remove_if(lv_curr.begin(), lv_curr.end(),
+                        [&](const std::shared_ptr<SSTableReader>& r) {
+                            return std::find(inputs_curr.begin(), inputs_curr.end(), r) != inputs_curr.end();
+                        }), lv_curr.end());
+
+                    auto& lv_next = levels_[i + 1];
+                    lv_next.erase(std::remove_if(lv_next.begin(), lv_next.end(),
+                        [&](const std::shared_ptr<SSTableReader>& r) {
+                            return std::find(inputs_next.begin(), inputs_next.end(), r) != inputs_next.end();
+                        }), lv_next.end());
+
+                    for (const auto& reader : new_readers) {
+                        lv_next.push_back(reader);
+                    }
+
+                    std::sort(lv_next.begin(), lv_next.end(), 
+                        [](const std::shared_ptr<SSTableReader>& a, const std::shared_ptr<SSTableReader>& b) { 
+                            return a->GetMinKey() < b->GetMinKey(); 
+                        });
+                }
+
+                for (const auto& r : all_inputs) {
+                    std::error_code ec;
+                    fs::remove(r->GetFilename(), ec);
+                }
+            }
+        }
+    }
+
+    void MaybeTriggerGC() {
+        if (shutting_down_.load()) return;
+        if (is_gcing_.exchange(true)) return;
+        
+        struct gcguard {
+            std::atomic<bool>& flag;
+            ~gcguard() { flag.store(false); }
+        } guard{is_gcing_};
+        
+        GCWork();
+    }
+
+    // 铁律 3：纯被动触发 + 严格垃圾率门禁，杜绝 0 垃圾强行兜底
+    void GCWork() {
+        struct SampleItem {
+            int key;
+            VLogPointer pos;
+        };
+        struct GCEntry {
+            int key;
+            std::string value;
+            VLogPointer current_pos;
+        };
+
+        if (shutting_down_.load()) return;
+
+        std::vector<uint32_t> inactive_vlogs;
+        std::string vlog_dir = base_dir_ + "vlog_storage";
+        if (!std::filesystem::exists(vlog_dir)) return;
+
+        uint32_t active_fid = vlog_.GetCurrentFileId();
+        for (const auto& entry : std::filesystem::directory_iterator(vlog_dir)) {
+            if (entry.path().extension() == ".log") {
+                uint32_t fid = ExtractId(entry.path().filename().string());
+                if (fid > 0 && fid != active_fid) {
+                    inactive_vlogs.push_back(fid);
+                }
+            }
+        }
+
+        // 积压段数少于 4 个时直接跳过，绝不打扰前台
+        if (inactive_vlogs.size() < 4) return;
+
+        std::sort(inactive_vlogs.begin(), inactive_vlogs.end());
+
+        double dynamic_threshold = 0.50; 
+        if (inactive_vlogs.size() > 50) {
+            dynamic_threshold = 0.30; 
+        }
+
+        uint32_t best_victim_id = 0;
+        double max_garbage_ratio = -1.0;
+
+        std::vector<uint32_t> sample_pool = inactive_vlogs;
+        std::random_device rd;
+        std::mt19937 g(rd());
+        std::shuffle(sample_pool.begin(), sample_pool.end(), g);
+            
+        int sample_count = std::min<int>(5, static_cast<int>(sample_pool.size()));
+            
+        for (int i = 0; i < sample_count; ++i) {
+            uint32_t fid = sample_pool[i];
+            std::string path = vlog_.GetPath(fid);
+            int fd = ::open(path.c_str(), O_RDONLY);
+            if (fd < 0) continue;
+
+            std::vector<SampleItem> samples;
+            samples.reserve(101);
+
+            uint64_t current_offset = 0;
+            int key;
+            uint32_t val_size;
+
+                // 采样子样本：每个段最多只探查头部 100 条数据，无锁磁盘 I/O
+            while (samples.size() < 100 && ::pread(fd, &key, sizeof(key), current_offset) == sizeof(key)) {
+                if (shutting_down_.load()) break;
+                if (::pread(fd, &val_size, sizeof(val_size), current_offset + sizeof(key)) != sizeof(val_size)) break;
+                uint32_t bytes_size = sizeof(key) + sizeof(val_size) + val_size;
+                VLogPointer currentpos = {fid, current_offset, val_size};
+                samples.push_back({key, currentpos});
+                current_offset += bytes_size;
+            }
+            ::close(fd);
+
+            if (samples.empty()) continue;
+
+            int stale_entries = 0;
+            {
+                std::unique_lock<std::mutex> sample_lock(rw_mutex_);
+                for (auto& sample : samples) {
+                    bool is_stale = true;
+                    std::string index_ptr_str_ = InternalGetPtrNoLock(sample.key);
+                    if (!index_ptr_str_.empty() && index_ptr_str_ != config::TOMBSTONE) {
+                        VLogPointer index_ptr = VLogPointer::Decode(index_ptr_str_);
+                        if (index_ptr.file_id == sample.pos.file_id && index_ptr.offset == sample.pos.offset) {
+                            is_stale = false;
+                        }
+                    }
+                    if (is_stale) stale_entries++;
+                }
+            }
+            double ratio = static_cast<double>(stale_entries) / samples.size();
+            if (ratio > max_garbage_ratio) {
+                max_garbage_ratio = ratio;
+                best_victim_id = fid;
+            }
+        }
+
+        // 严格硬拦截：垃圾率不足阈值或低于 20% 时直接返回，彻底杜绝 0 垃圾无意义重写
+        if (max_garbage_ratio < dynamic_threshold || best_victim_id == 0 || max_garbage_ratio <= 0.20) {
+            return; 
+        }
+
+        std::cout << "\n[GC]  锁定高垃圾率目标: vlog_" << best_victim_id << ".log | 预计垃圾率: " 
+                  << (max_garbage_ratio * 100) << "%" << std::endl;
+
+        uint32_t victim_id = best_victim_id;
+        std::string path = vlog_.GetPath(victim_id);
+        int fd = ::open(path.c_str(), O_RDONLY);
+        if (fd < 0) return;
+
+        uint64_t current_offset = 0;
+        uint64_t chunk_bytes = 0;
+        uint64_t chunk_start_offset = 0;
+
+        int key;
+        uint32_t val_size;
+        int valid_count = 0, stale_count = 0;
+
+        std::vector<GCEntry> gc_batch;
+        gc_batch.reserve(256);
+
+        auto FlushGCBatch = [&](std::vector<GCEntry>& batch) {
+            if (batch.empty()) return;
+
+            std::vector<VLogPointer> new_ptrs;
+            new_ptrs.reserve(batch.size());
+            {
+                std::lock_guard<std::mutex> vlog_lock(vlog_mutex_);
+                for (const auto& item : batch) {
+                    new_ptrs.push_back(vlog_.Append(item.key, item.value));
+                }
+            }
+
+            {
+                std::unique_lock<std::mutex> write_lock(rw_mutex_);
+                ThreadWrite::WriteBatch wal_batch;
+
+                for (size_t i = 0; i < batch.size(); ++i) {
+                    std::string double_check_str = InternalGetPtrNoLock(batch[i].key);
+                    if (!double_check_str.empty() && double_check_str != config::TOMBSTONE) {
+                        VLogPointer check_ptr = VLogPointer::Decode(double_check_str);
+                        
+                        if (check_ptr.file_id == batch[i].current_pos.file_id && check_ptr.offset == batch[i].current_pos.offset) {
+                            std::string new_ptr_encoded = new_ptrs[i].Encode();
+                            wal_batch.entries.push_back({batch[i].key, new_ptr_encoded});
+                            memtable_.insert(batch[i].key, new_ptr_encoded, memtable_.RandomLevel());
+                            valid_count++;
+                            continue;
+                        }
+                    }
+                    stale_count++;
+                }
+
+                if (!wal_batch.entries.empty()) {
+                    wal_.LogBatch(wal_batch);
+                }
+                MaybeSwapMemtable(write_lock);
+            }
+            batch.clear();
+            std::this_thread::sleep_for(std::chrono::microseconds(200)); // 让路前台写入
+        };
+
+        while (::pread(fd, &key, sizeof(key), current_offset) == sizeof(key)) {
+            if (shutting_down_.load()) break;
+
+            if (::pread(fd, &val_size, sizeof(val_size), current_offset + sizeof(key)) != sizeof(val_size)) break;
+
+            std::string value;
+            value.resize(val_size);
+            if (::pread(fd, &value[0], val_size, current_offset + sizeof(key) + sizeof(val_size)) != static_cast<ssize_t>(val_size)) break;
+
+            VLogPointer current_pos = {victim_id, current_offset, val_size};
+            uint32_t entry_bytes = sizeof(key) + sizeof(val_size) + val_size;
+            current_offset += entry_bytes;
+            chunk_bytes += entry_bytes;
+
+            if (chunk_bytes >= 16 * 1024 * 1024) {
+                ::posix_fadvise(fd, chunk_start_offset, chunk_bytes, POSIX_FADV_DONTNEED);
+                chunk_start_offset = current_offset;
+                chunk_bytes = 0;
+            }
+
+            std::string indexed_ptr_str;
+            {
+                std::unique_lock<std::mutex> lock(rw_mutex_);
+                indexed_ptr_str = InternalGetPtrNoLock(key);
+            }
+
+            if (!indexed_ptr_str.empty() && indexed_ptr_str != config::TOMBSTONE) {
+                VLogPointer indexed_ptr = VLogPointer::Decode(indexed_ptr_str);
+                if (indexed_ptr.file_id == current_pos.file_id && indexed_ptr.offset == current_pos.offset) {
+                    gc_batch.push_back({key, std::move(value), current_pos});
+                    if (gc_batch.size() >= 256) {
+                        FlushGCBatch(gc_batch);
+                    }
+                    continue;
+                }
+            }
+            stale_count++;
+        }
+
+        FlushGCBatch(gc_batch);
+
+        if (chunk_bytes > 0) {
+            ::posix_fadvise(fd, chunk_start_offset, chunk_bytes, POSIX_FADV_DONTNEED);
+        }
+        ::close(fd);
+
+        // 仅在 vlog_mutex_ 保护下注销并删除文件，绝不持有 rw_mutex_ 阻塞前台读写
+        {
+            std::lock_guard<std::mutex> vlog_lock(vlog_mutex_);
+            vlog_.RemoveSegment(victim_id);
+        }
+
+        std::cout << "[GC] 清洗完成！搬运有效数据: " << valid_count 
+                  << " 条 | 丢弃垃圾碎片: " << stale_count << " 条。" << std::endl;
+    }
+
+    int ExtractId(const std::string& filename) {
+        size_t last_underscore = filename.find_last_of('_');
+        size_t last_dot = filename.find_last_of('.');
+        if (last_underscore != std::string::npos && last_dot != std::string::npos) {
+            std::string id_str = filename.substr(last_underscore + 1, last_dot - last_underscore - 1);
+            try {
+                return std::stoi(id_str);
+            } catch (...) { return 0; }
+        }
+        return 0;
+    }
+
+    // 铁律 2：Immutable 队列门禁放宽至 8，提供充足平滑写缓冲
+    void MaybeSwapMemtable(std::unique_lock<std::mutex>& lsm_lock) {
+        if (arena_.memory_usage() > config::K_MEMTABLE_THRESHOLD) {
+            
+            while (imm_queue_size_.load() >= 8 && !shutting_down_.load()) {
+                lsm_lock.unlock(); 
+                {
+                    std::unique_lock<std::mutex> cv_lock(cv_mutex_);
+                    put_cv_.wait(cv_lock, [this] { return imm_queue_size_.load() < 8 || shutting_down_.load(); });
+                }
+                lsm_lock.lock(); 
+            }
+            
+            if (shutting_down_.load()) return;
+
+            auto imm_ctx = std::make_shared<ImmContext>(12);
+            arena_.Swap(*(imm_ctx->arena));
+            imm_ctx->mem->StealFrom(memtable_);
+            memtable_.Clear();
+            
+            imm_queue_.push_back(imm_ctx);
+            imm_queue_size_.fetch_add(1);
+            
+            lsm_lock.unlock(); 
+            
+            high_pri_pool.Enqueue([this]() {
+                SingleFlushTask();
+            });
+        }
+    }
+
+    // 铁律 1：先挂载新 SSTable，再弹出 Immutable 队列，0 读黑洞
+    void SingleFlushTask() {
+        std::shared_ptr<ImmContext> imm_to_flush;
+        {
+            std::unique_lock<std::mutex> lock_(rw_mutex_);
+            if (imm_queue_.empty()) return;
+            imm_to_flush = imm_queue_.front(); // 仅引用，绝不提前 pop
+        }
+
+        int new_file_id = file_id_.fetch_add(1);
+        std::string name = base_dir_ + "data_L0_" + std::to_string(new_file_id) + ".sst";
+
+        SSTableBuilder local_builder;
+        local_builder.Build(*(imm_to_flush->mem), name);
+
+        {
+            std::unique_lock<std::mutex> lock_(rw_mutex_);
+            
+            // 1. 先挂载至 L0，使新 SST 对读路径立即可见
+            levels_[0].push_back(std::make_shared<SSTableReader>(name));
+
+            VersionEdit vedt_;
+            vedt_.AddFile(0, new_file_id, local_builder.GetFileSize(), local_builder.GetMinKey(), local_builder.GetMaxKey());
+            manifest_manager_.LogAndApply(vedt_);
+
+            // 2. 新 SST 已可见，此时安全弹出 Immutable，消除读穿透黑洞
+            imm_queue_.pop_front();
+            imm_queue_size_.fetch_sub(1);
+        }
+
+        {
+            std::unique_lock<std::mutex> lock_(cv_mutex_);
+            put_cv_.notify_all();
+        }
+
+        // 联动触发 Compaction 与被动 GC 检查
+        low_pri_pool.Enqueue([this]() {
+            MaybeTriggerCompaction();
+            MaybeTriggerGC();
+        });
+    }
+
+    
+
+private:
+    std::string base_dir_; 
+
+    Arena arena_;
+    skiplist memtable_;
+    //通过双端队列
+    std::deque<std::shared_ptr<ImmContext>> imm_queue_;
+    std::atomic<int> imm_queue_size_{0};
+    
+    ShardedLRUCache lru_cache_{10000, 16};
+    
+    WalManager wal_;
+    ValueLog vlog_;
+    SSTableBuilder builder_;
+    ManifestManager manifest_manager_;
+    ThreadWrite thread_write_;
+
+    std::vector<std::vector<std::shared_ptr<SSTableReader>>> levels_;
+    
+    std::mutex queue_mutex_;
+    std::mutex rw_mutex_;   
+    std::mutex vlog_mutex_;                
+    std::mutex cv_mutex_;      
+
+    std::condition_variable put_cv_;       
+    
+    ThreadPool high_pri_pool;//负责flush
+    ThreadPool low_pri_pool;//负责compaction和gc
+    
+    std::atomic<bool> shutting_down_;
+    std::atomic<bool> is_compacting_;
+    std::atomic<bool> is_gcing_;
+    std::atomic<int> file_id_;
+};

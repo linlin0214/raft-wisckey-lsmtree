@@ -18,9 +18,11 @@
 class WalManager {
 public:
     //  构造函数新增 sync_mode 参数（默认不强刷盘，交由 Page Cache 或后台异步处理）
-    WalManager(const std::string& log_path, bool sync_mode = false) 
-        : log_path_(log_path), sync_mode_(sync_mode), stop_thread_(false), is_dirty_(false) {
-        
+    WalManager(const std::string& log_path, bool sync_mode = false, bool disable = false) 
+        : log_path_(log_path), sync_mode_(sync_mode), disable_(disable), stop_thread_(false), is_dirty_(false) {
+        if (disable_) {
+            return;
+        }
         dest_ = std::fopen(log_path_.size() > 0 ? log_path_.c_str() : "default.wal", "ab"); 
         if (!dest_) {
             throw std::runtime_error("CAN'T OPEN LOG FILE: " + log_path_);
@@ -32,6 +34,7 @@ public:
     }
 
     ~WalManager() {
+        if (disable_) return;
         stop_thread_ = true;
         cv_.notify_all(); 
         
@@ -49,12 +52,14 @@ public:
 
     // 强一致性刷盘物理接口
     void Sync() {
+        if (disable_) return;
         std::lock_guard<std::mutex> lock(mtx_);
         SyncUnlocked();
     }
 
     // 单条写入（仅进入内存，极速）
     void LogPut(int key, const std::string& value, int level) {
+        if (disable_) return;
         char header[13];
         header[0] = 1; 
         std::memcpy(header + 1, &key, 4);
@@ -76,6 +81,7 @@ public:
 
     // 数据库崩溃冷启动恢复
     void recovery(skiplist& list) {
+        if (disable_) return;
         std::lock_guard<std::mutex> lock(mtx_);
         if (dest_) {
             std::fflush(dest_); 
@@ -124,6 +130,7 @@ public:
     }
 
     void ResetLog() {
+        if (disable_) return;
         std::lock_guard<std::mutex> lock(mtx_);
         buffer_.clear(); 
         is_dirty_.store(false, std::memory_order_release);
@@ -134,6 +141,7 @@ public:
 
     // Group Commit 写入链
     void LogBatch(const ThreadWrite::WriteBatch& batch) {
+        if (disable_) return;
         if (batch.entries.empty()) return;
 
         std::string batch_buffer;
@@ -212,7 +220,7 @@ private:
             }
         }
     }
-
+    bool disable_{false};
     FILE* dest_ = nullptr; 
     std::string log_path_;
     std::string buffer_;

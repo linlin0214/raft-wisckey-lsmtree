@@ -8,7 +8,11 @@
 RaftStorageAdapter::RaftStorageAdapter(const std::string& base_dir)
     : base_dir_(base_dir),
       log_engine_([&](){ std::filesystem::create_directories(base_dir); return base_dir + "/raft.log"; }()),
-      state_machine_(std::make_unique<DB>(base_dir + "/kv_data")),
+      state_machine_([&]() {
+          Options opts;
+          opts.disable_wal = true;
+          return std::make_unique<DB>(base_dir + "/kv_data", opts);
+      }()),
       meta_path_(base_dir + "/raft.meta"),
       snap_meta_path_(base_dir + "/snapshot.meta") {
     LoadHardState();
@@ -360,6 +364,9 @@ void RaftStorageAdapter::ApplySnapshot(const std::string& snapshot_file_path, ui
     state_machine_.reset(); 
     DB::DestroyDB(tmp_dir); 
     
+    Options opts;
+    opts.disable_wal = true;//快照恢复时的临时 DB 同样关闭 WAL
+
     auto tmp_db = std::make_unique<DB>(tmp_dir);
     std::ifstream ifs(snapshot_file_path, std::ios::binary);
     int key; 
@@ -392,7 +399,7 @@ void RaftStorageAdapter::ApplySnapshot(const std::string& snapshot_file_path, ui
 
     std::filesystem::remove_all(backup_dir, ec);
 
-    state_machine_ = std::make_unique<DB>(target_dir);
+    state_machine_ = std::make_unique<DB>(target_dir, opts);//重建后的 DB 保持 disable_wal = true
     
     log_engine_.TruncatePrefix(last_included_index);
 

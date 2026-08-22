@@ -45,7 +45,7 @@ struct ImmContext {
 
 class DB {
 public:
-    DB(const std::string& db_dir) 
+    explicit DB(const std::string& db_dir, const Options& options = Options()) 
         : base_dir_([&]() {
               std::string dir = db_dir;
               if (!dir.empty() && dir.back() != '/' && dir.back() != '\\') {
@@ -53,17 +53,19 @@ public:
               }
               return dir;
           }()), 
+          options_(options), //保存全局配置
           arena_(),                     
           memtable_(12, &arena_),
-          wal_(base_dir_ + "production.wal"), 
+          //将 options_.disable_wal 透传给 WalManager
+          wal_(base_dir_ + "production.wal", false, options_.disable_wal), 
           vlog_(base_dir_ + "vlog_storage"), 
           manifest_manager_(base_dir_), 
-          high_pri_pool(1), // 铁律 1：Flush 保持单线程，保证 L0 顺序与 WAL 安全
+          high_pri_pool(1),
           low_pri_pool(2),
           shutting_down_(false),
           is_compacting_(false),
           is_gcing_(false),
-          file_id_(0){
+          file_id_(0) {
         
         std::filesystem::create_directories(base_dir_);
         levels_.resize(config::K_NUM_LEVELS); 
@@ -77,7 +79,10 @@ public:
         }
         file_id_.store(max_id + 1); 
 
-        wal_.recovery(memtable_); 
+        // 仅当 WAL 启用时才执行单机 recovery
+        if (!options_.disable_wal) {
+            wal_.recovery(memtable_); 
+        }
     }
 
     ~DB() {
@@ -129,7 +134,9 @@ public:
                 //memtable写入
                 memtable_.insert(k,ptr,memtable_.RandomLevel());  
             }
-            wal_.LogBatch(batch);
+            if (!options_.disable_wal) {
+                wal_.LogBatch(batch);
+            }
 
             MaybeSwapMemtable(lock);
         }
@@ -760,6 +767,7 @@ private:
     
 
 private:
+    Options options_;
     std::string base_dir_; 
 
     Arena arena_;

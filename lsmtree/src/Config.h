@@ -20,6 +20,7 @@ struct Options {
     size_t memtable_size = 12;                       
     size_t sst_file_size = config::TARGET_FILE_SIZE; 
     size_t vlog_segment_size = config::MAX_VLOG_SEGMENT_SIZE; 
+    bool disable_wal = false; //支持分布式下彻底关闭单机 LSM-Tree 的 WAL
 };
 
 // 物理路径生成器：使用 std::filesystem 完全规避跨平台斜杠问题

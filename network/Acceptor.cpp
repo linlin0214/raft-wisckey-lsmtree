@@ -83,7 +83,7 @@ void Acceptor::Listen() {
 void Acceptor::HandleRead() {
     loop_->AssertInLoopThread(); // 守卫单线程控制面
 
-    // ET / LT 兼容贪婪收割循环
+    //LT
     while (true) {
         struct sockaddr_in peer_addr;
         std::memset(&peer_addr, 0, sizeof(peer_addr));

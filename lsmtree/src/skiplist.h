@@ -1,19 +1,18 @@
 #pragma once
 
-#include <string>
-#include <cstring> //  用于 memcpy
-#include <cstdint>
 #include "Arena.h"
+#include "Slice.h"
+#include <string>
+#include <string_view>
+#include <cstring>
+#include <cstdint>
 
 //  链表节点定义
 struct Node {
-    int key;
-    //  将 std::string 替换为原生 char* 指针和长度，防止内存逃逸至 heap，彻底杜绝系统内存碎片
+    uint16_t key_len;
+    uint16_t height;
     uint32_t val_len;
-    char* val_ptr;
-    
-    //  彻底抛弃 struct 基础指针运算，采用绝对物理地址偏移 + void* 字节拷贝
-    // 100% 斩断 GCC -O3 别名分析器的任何激进剪枝假设
+
     Node* forward(int level) const {
         uintptr_t base_addr = reinterpret_cast<uintptr_t>(this) + sizeof(Node);
         Node* ptr = nullptr;
@@ -26,41 +25,49 @@ struct Node {
         std::memcpy(reinterpret_cast<void*>(base_addr + level * sizeof(Node*)), &ptr, sizeof(Node*));
     }
 
-    std::string GetValue() const {
-        if (val_len == 0 || val_ptr == nullptr) return "";
-        return std::string(val_ptr, val_len);
+    const char* key_data() const {
+        uintptr_t payload_addr = reinterpret_cast<uintptr_t>(this) + sizeof(Node) + height * sizeof(Node*);
+        return reinterpret_cast<const char*>(payload_addr);
     }
 
-    //  height = level + 1 (例如 level 0 实际上有 1 层前向指针)
-    static Node* NewNode(Arena* arena, int k, const std::string& v, int height) {
-        //  Node 自身大小（16 字节）+ 所有的层高指针所需的额外空间
-        size_t size = sizeof(Node) + sizeof(Node*) * height;
-        char* mem = arena->Allocatealigned(size);
+    const char* val_data() const {
+        return key_data() + key_len;
+    }
 
-        //  完全不通过 OS 申请堆内存，直接把 Arena 给它的现成对齐地址 mem 拿来进行 placement new 构造
-        Node* node = new(mem) Node(k);
+    Slice key() const {
+        return Slice(key_data(), key_len);
+    }
 
-        //  将字符串的真实载荷也存入 Arena，消除系统堆碎片 and 内存泄漏
+    std::string GetValue() const {
+        if (val_len == 0) return "";
+        return std::string(val_data(), val_len);
+    }
+
+    // 单次物理内存连续分配
+    static Node* NewNode(Arena* arena, const Slice& k, std::string_view v, int height) {
+        size_t node_base = sizeof(Node) + sizeof(Node*) * height;
+        size_t total_size = node_base + k.size() + v.size();
+        char* mem = arena->Allocatealigned(total_size);
+
+        Node* node = reinterpret_cast<Node*>(mem);
+        node->key_len = static_cast<uint16_t>(k.size());
+        node->height = static_cast<uint16_t>(height);
         node->val_len = static_cast<uint32_t>(v.size());
-        if (node->val_len > 0) {
-            node->val_ptr = arena->Allocate(node->val_len);
-            std::memcpy(node->val_ptr, v.data(), node->val_len);
-        } else {
-            node->val_ptr = nullptr;
-        }
 
-        //  将所有层级的前向指针安全初始化为 nullptr
         for (int i = 0; i < height; ++i) {
             node->set_forward(i, nullptr);
         }
+
+        char* payload = mem + node_base;
+        if (k.size() > 0) {
+            std::memcpy(payload, k.data(), k.size());
+        }
+        if (v.size() > 0) {
+            std::memcpy(payload + k.size(), v.data(), v.size());
+        }
+
         return node;
     }
-
-    Node(int k) : key(k), val_len(0), val_ptr(nullptr) {}
-
-    ~Node() = default;
-    Node(const Node&) = delete;
-    Node& operator=(const Node&) = delete;
 };
 
 class skiplist {
@@ -70,27 +77,26 @@ public:
         explicit Iterator(Node* node) : current_(node) {}
         bool Valid() const { return current_ != nullptr; }
         void Next() { current_ = current_->forward(0); }
-        int key() const { return current_->key; }
+        Slice key() const { return current_->key(); }
         std::string value() const { return current_->GetValue(); }
     private:
         Node* current_;
     };
 
-    Iterator Begin() {
+    Iterator Begin() const {
         return Iterator(header->forward(0));
     }
 
     skiplist(int maxl, Arena* arena)
-        : cur_level(0),max_level(maxl), arena_(arena)
-    {
-        // 安全升级：将哨兵头节点的 key 初始化为 INT_MIN，建立绝对的左侧安全护城河
-        header = Node::NewNode(arena_, -2147483648, "", max_level);
+        : cur_level(0), max_level(maxl), arena_(arena) {
+        // 头节点 Sentinel 维持空 Slice，仅作为搜索锚点，其 Key 不参与实际对比
+        header = Node::NewNode(arena_, Slice(""), "", max_level);
     }
 
-    ~skiplist() {}
+    ~skiplist() = default;
 
-    const Node* search(int target) const;
-    void insert(int key, const std::string& s, int level);
+    const Node* search(const Slice& target) const;
+    void insert(const Slice& key, std::string_view value, int level);
 
     void StealFrom(const skiplist& other) {
         this->header = other.header;
@@ -99,15 +105,15 @@ public:
 
     void Clear() {
         cur_level = 0;
-        header = Node::NewNode(arena_, -2147483648, "", max_level);
+        header = Node::NewNode(arena_, Slice(""), "", max_level);
     }
 
     bool empty() const {
         return header->forward(0) == nullptr;
     }
 
-    //  黄金重构：在每次循环决定晋升时重新迭代 seed！
-    // 这能让跳表节点高度产生完美的几何分布，彻底恢复 $O(\log N)$ 的工业级结构性能
+    //  黄金重构：在每次循环决定晋升时重新迭代 seed
+    // 这能让跳表节点高度产生完美的几何分布，恢复 O(\log N) 的工业级结构性能
     int RandomLevel() {
         thread_local uint32_t seed = 2463534242U;
         int lvl = 0;
@@ -131,22 +137,21 @@ private:
     Arena* arena_;
 };
 
-inline const Node* skiplist::search(int target) const {
+inline const Node* skiplist::search(const Slice& target) const {
     const Node* cur = header;
     for (int i = cur_level; i >= 0; --i) {
-        while (cur->forward(i) != nullptr && cur->forward(i)->key < target) {
+        while (cur->forward(i) != nullptr && cur->forward(i)->key().compare(target) < 0) {
             cur = cur->forward(i);
         }
     }
     cur = cur->forward(0);
-    if (cur != nullptr && cur->key == target) {
+    if (cur != nullptr && cur->key().compare(target) == 0) {
         return cur;
-    } else {
-        return nullptr;
     }
+    return nullptr;
 }
 
-inline void skiplist::insert(int key, const std::string& value, int level) {
+inline void skiplist::insert(const Slice& key, std::string_view value, int level) {
     if (level >= max_level) level = max_level - 1;
 
     Node* update[64];
@@ -159,13 +164,13 @@ inline void skiplist::insert(int key, const std::string& value, int level) {
     }
 
     for (int i = cur_level; i >= 0; --i) {
-        while (cur->forward(i) != nullptr && cur->forward(i)->key < key) {
+        while (cur->forward(i) != nullptr && cur->forward(i)->key().compare(key) < 0) {
             cur = cur->forward(i);
         }
         update[i] = cur;
     }
 
-    int height = level + 1; 
+    int height = level + 1;
     Node* newnode = Node::NewNode(arena_, key, value, height);
 
     for (int i = 0; i <= level; ++i) {

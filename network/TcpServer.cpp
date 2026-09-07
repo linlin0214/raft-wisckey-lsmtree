@@ -77,3 +77,23 @@ void TcpServer::RemoveConnection(const std::shared_ptr<Connection>& conn) {
     // 同步解绑 Epoll 并完成资源回收
     conn->ConnectionDestroyed();
 }
+
+void TcpServer::Stop() {
+    loop_->AssertInLoopThread();
+    spdlog::info("[TcpServer] 停止监听，注销迎宾套接字并切断现有连接...");
+    
+    // 1. 物理销毁 Acceptor，立刻拔除 listen_fd 并从 Epoll 树注销
+    if (acceptor_) {
+        acceptor_.reset();
+    }
+
+    // 2. 清理所有客户端现有连接，解绑回调以防悬空调用
+    for (auto& item : connections_) {
+        std::shared_ptr<Connection> conn = item.second;
+        if (conn) {
+            conn->SetCloseCallback(nullptr);
+            conn->ConnectionDestroyed();
+        }
+    }
+    connections_.clear();
+}

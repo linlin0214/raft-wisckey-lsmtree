@@ -1,4 +1,5 @@
 #pragma once
+
 #include <cstdint>
 #include <string>
 #include <cstring>
@@ -7,7 +8,7 @@
 
 namespace raft_rpc {
 
-// 0. 网络字节序大端编解码辅助工具函数
+// 0. 网络字节序大端编解码辅助工具函数 (Zero-Heap Overhead)
 inline void EncodeUint64(char* dst, uint64_t val) {
     uint8_t* ptr = reinterpret_cast<uint8_t*>(dst);
     ptr[0] = static_cast<uint8_t>((val >> 56) & 0xFF);
@@ -50,14 +51,16 @@ inline uint32_t DecodeUint32(const char* src) {
 
 // 1. Raft 业务操作码定义 (Opcode)
 enum RaftOpcode : uint8_t {
-    kRequestVote          = 0x01,  // 选票请求Args
-    kRequestVoteReply     = 0x02,  // 选票响应Reply
-    kAppendEntries        = 0x03,  // 日志同步/心跳Args
-    kAppendEntriesReply   = 0x04,  // 日志同步响应Reply
-    kInstallSnapshot      = 0x05,  // 流式安装快照Args
-    kInstallSnapshotReply = 0x06,   // 流式安装快照Reply
-    kPreVote = 0x07, // 预投票args
-    kPrevoteReply = 0x08, //预投票回复
+    kRequestVote          = 0x01,  // 正式选票请求 Args
+    kRequestVoteReply     = 0x02,  // 正式选票响应 Reply
+    kAppendEntries        = 0x03,  // 日志同步 / 心跳 Args
+    kAppendEntriesReply   = 0x04,  // 日志同步响应 Reply
+    kInstallSnapshot      = 0x05,  // 流式安装快照 Args
+    kInstallSnapshotReply = 0x06,  // 流式安装快照 Reply
+    kPreVote              = 0x07,  // 预投票试探 Args
+    kPreVoteReply         = 0x08,  // 预投票试探响应 Reply (修正命名)
+    kReadIndex            = 0x09,  // 线性一致读 Args (预留)
+    kReadIndexReply       = 0x0A   // 线性一致读 Reply (预留)
 };
 
 enum class EntryType : uint8_t {
@@ -67,15 +70,15 @@ enum class EntryType : uint8_t {
 
 // 2. 日志条目定义
 struct LogEntry {
-    uint64_t index{0};       // 日志在一致性队列中的物理下标
-    uint64_t term{0};        // 产生该日志时的 Leader 任期
-    EntryType type{EntryType::kNormal}; // 日志条目类型
-    std::string data;        // 业务载荷
+    uint64_t index{0};                  // 日志物理索引
+    uint64_t term{0};                   // Leader 任期
+    EntryType type{EntryType::kNormal}; // 条目类型
+    std::string data;                   // 业务载荷
 
     std::string Serialize() const {
         uint32_t body_len = static_cast<uint32_t>(data.size());
         std::string buf;
-        buf.resize(8 + 8 + 1 + 4 + body_len); // 21 + body_len
+        buf.resize(8 + 8 + 1 + 4 + body_len); // 21 字节 Header + 载荷
 
         char* ptr = &buf[0];
         EncodeUint64(ptr, index); ptr += 8;
@@ -106,10 +109,10 @@ struct LogEntry {
     }
 };
 
-// 3. Raft 选票请求与响应结构体
+// 3. Raft 选票请求与响应结构体 (含 Pre-Vote 复用别名)
 struct RequestVoteArgs {
-    uint64_t term{0};          // 候选人的当前任期
-    uint32_t candidate_id{0};  // 候选人自己的 ID
+    uint64_t term{0};          // 候选人的任期 (或 PreVote 试探的 term + 1)
+    uint32_t candidate_id{0};  // 候选人节点 ID
     uint64_t last_log_index{0};// 候选人最后一条日志索引
     uint64_t last_log_term{0}; // 候选人最后一条日志任期
 
@@ -138,7 +141,7 @@ struct RequestVoteArgs {
 
 struct RequestVoteReply {
     uint64_t term{0};         // 当前任期
-    bool vote_granted{false}; // 是否投给他
+    bool vote_granted{false}; // 是否同意给票 / 准入
     uint64_t voter_id{0};     // 投票节点 ID
 
     std::string Serialize() const {
@@ -162,7 +165,11 @@ struct RequestVoteReply {
     }
 };
 
-// 4. AppendEntries 日志同步结构体
+using PreVoteArgs = RequestVoteArgs;
+using PreVoteReply = RequestVoteReply;
+
+
+// 4.AppendEntries 日志同步结构体
 struct AppendEntriesArgs {
     uint64_t term{0}; 
     uint64_t leader_id{0}; 
@@ -244,13 +251,13 @@ struct AppendEntriesReply {
     }
 };
 
-// 5. 流式安装快照物理协议包格式 (InstallSnapshot)
+// 5. 流式安装快照协议包 (InstallSnapshot)
 struct InstallSnapshotArgs {
     uint64_t term{0};                 // Leader 当前任期
     uint64_t leader_id{0};            // Leader 节点 ID
     uint64_t last_included_index{0};  // 快照中最后一条日志 Index
     uint64_t last_included_term{0};   // 快照中最后一条日志 Term
-    std::string snapshot_filepath;    // 快照文件存根路径
+    std::string snapshot_filepath;    // 快照文件物理存根路径
 
     std::string Serialize() const {
         uint32_t path_len = static_cast<uint32_t>(snapshot_filepath.size());
@@ -314,7 +321,7 @@ struct InstallSnapshotReply {
     }
 };
 
-// 6.在 Raft 的日志复制阶段，实现网络传输的“打包”与“拆包”。批处理entries
+// 6. 批量日志条目网络打包与拆包工具函数
 inline std::string SerializeEntries(const std::vector<LogEntry>& entries) {
     std::string res;
     uint32_t count = static_cast<uint32_t>(entries.size());
@@ -342,7 +349,7 @@ inline std::vector<LogEntry> DeserializeEntries(std::string_view src) {
     
     uint32_t count = DecodeUint32(ptr);
     ptr += 4;
-    //防恶意攻击
+
     if (count > 0 && count <= 100000) {
         entries.reserve(count);
     }

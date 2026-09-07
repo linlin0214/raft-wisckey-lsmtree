@@ -13,6 +13,8 @@
 #include "LRUCache.h"
 #include "ThreadWrite.h"
 #include "ThreadPool.h"
+#include "Iterator.h"
+#include "Slice.h"
 #include <cstddef>
 #include <memory>
 #include <vector>
@@ -53,10 +55,9 @@ public:
               }
               return dir;
           }()), 
-          options_(options), //保存全局配置
+          options_(options),
           arena_(),                     
           memtable_(12, &arena_),
-          //将 options_.disable_wal 透传给 WalManager
           wal_(base_dir_ + "production.wal", false, options_.disable_wal), 
           vlog_(base_dir_ + "vlog_storage"), 
           manifest_manager_(base_dir_), 
@@ -79,7 +80,6 @@ public:
         }
         file_id_.store(max_id + 1); 
 
-        // 仅当 WAL 启用时才执行单机 recovery
         if (!options_.disable_wal) {
             wal_.recovery(memtable_); 
         }
@@ -93,47 +93,39 @@ public:
         }
     }
 
-    void Put(int key, const std::string& value) {
-        // 在当前线程栈上构造 Writer 节点
-        ThreadWrite::Writer w(key,&value);
-        //CAS入栈构建链表
+    void Put(const Slice& key, const std::string& value) {
+        ThreadWrite::Writer w(key, &value);
         thread_write_.JoinBatchGroup(&w);
-        //follower等待
-        if(w.state.load(std::memory_order_acquire)==ThreadWrite::STATE_FOLLOWER){
-            thread_write_.AwaitState(&w,ThreadWrite::STATE_COMPLETE);
-            return ;//leader完成了wal，memtable写入
+        if (w.state.load(std::memory_order_acquire) == ThreadWrite::STATE_FOLLOWER) {
+            thread_write_.AwaitState(&w, ThreadWrite::STATE_COMPLETE);
+            return;
         }
 
-        //leader操作批处理
         std::vector<ThreadWrite::Writer*> batch_group;
         thread_write_.EnterAsBatchGroupLeader(batch_group);
 
-        //进行vlog写入
         std::vector<std::string> encode_ptr;
         encode_ptr.reserve(batch_group.size());
         {  
-            //只是内存操作
             std::unique_lock<std::mutex> lock(vlog_mutex_);
             for (auto writer : batch_group) {
-                VLogPointer vlog_ptr = vlog_.Append(writer->key, *(writer->value));
+                VLogPointer vlog_ptr = vlog_.Append(Slice(writer->key), *(writer->value));
                 encode_ptr.push_back(vlog_ptr.Encode());
             }
         }
-        //wal和memtable
+
         {
             std::unique_lock<std::mutex> lock(rw_mutex_);
-
             ThreadWrite::WriteBatch batch;
             batch.entries.reserve(batch_group.size());
 
             for (size_t i = 0; i < batch_group.size(); ++i) {
-                int k = batch_group[i]->key;
+                const std::string& k = batch_group[i]->key;
                 const std::string& ptr = encode_ptr[i];
-                //构造wal的batch
-                batch.entries.push_back({k,ptr});
-                //memtable写入
-                memtable_.insert(k,ptr,memtable_.RandomLevel());  
+                batch.entries.push_back({k, ptr});
+                memtable_.insert(Slice(k), ptr, memtable_.RandomLevel());  
             }
+
             if (!options_.disable_wal) {
                 wal_.LogBatch(batch);
             }
@@ -143,11 +135,11 @@ public:
         thread_write_.ExitAsBatchGroupLeader(batch_group);
     }
 
-    void Delete(int key) {
+    void Delete(const Slice& key) {
         Put(key, config::TOMBSTONE); 
     }
 
-    std::string Get(int key) {
+    std::string Get(const Slice& key) {
         std::unique_lock<std::mutex> lock(rw_mutex_);
         
         std::string internal_val = InternalGetPtrNoLock(key);
@@ -180,70 +172,59 @@ public:
         }
     }
 
-    std::vector<std::pair<int, std::string>> GetAllKVs() {
-        std::unordered_map<int,std::string> snapshot_map;
+    std::unique_ptr<MergingIterator> NewMergingIterator() {
+        std::vector<std::shared_ptr<ImmContext>> imm_snapshot;
+        std::vector<std::vector<std::shared_ptr<SSTableReader>>> levels_snapshot;
+
         {
             std::unique_lock<std::mutex> lock(rw_mutex_);
 
-            for (int l = config::K_NUM_LEVELS - 1; l >= 1; --l) {
-                for (const auto& reader : levels_[l]) {
-                    SSTableIterator it(reader.get());
-                    while (it.Valid()) {
-                        snapshot_map[it.Key()] = it.Value();
-                        it.Next();
-                    }
-                }
+            if (!memtable_.empty()) {
+                auto imm_ctx = std::make_shared<ImmContext>(12);
+                arena_.Swap(*(imm_ctx->arena));
+                imm_ctx->mem->StealFrom(memtable_);
+                memtable_.Clear();
+                imm_queue_.push_back(imm_ctx);
+                imm_queue_size_.fetch_add(1);
             }
 
-            for (const auto& reader : levels_[0]) {
-                SSTableIterator it(reader.get());
-                while (it.Valid()) {
-                    snapshot_map[it.Key()] = it.Value();
-                    it.Next();
-                }
-            }
+            imm_snapshot.assign(imm_queue_.begin(), imm_queue_.end());
+            levels_snapshot = levels_;
+        }
 
-            for (auto q_it = imm_queue_.begin(); q_it != imm_queue_.end(); ++q_it) {
-                skiplist::Iterator it = (*q_it)->mem->Begin();
-                while (it.Valid()) {
-                    snapshot_map[it.key()] = it.value();
-                    it.Next();
-                }
-            }
+        std::vector<std::unique_ptr<StorageIterator>> iters;
+        
+        for (auto it = imm_snapshot.rbegin(); it != imm_snapshot.rend(); ++it) {
+            iters.push_back(std::make_unique<MemTableIteratorAdaptor>((*it)->mem->Begin(), *it));
+        }
 
-            skiplist::Iterator it = memtable_.Begin();
-            while (it.Valid()) {
-                snapshot_map[it.key()] = it.value();
-                it.Next();
+        if (!levels_snapshot.empty() && !levels_snapshot[0].empty()) {
+            auto l0_files = levels_snapshot[0];
+            std::sort(l0_files.begin(), l0_files.end(), [this](const auto& a, const auto& b) {
+                return ExtractId(a->GetFilename()) > ExtractId(b->GetFilename());
+            });
+            for (const auto& reader : l0_files) {
+                iters.push_back(std::make_unique<SSTableIteratorAdaptor>(reader));
             }
         }
 
-        std::vector<std::pair<int, std::string>> result;
-        result.reserve(snapshot_map.size());
-
-        {
-            std::lock_guard<std::mutex> vlog_lock(vlog_mutex_);
-            
-            for (const auto& [k, ptr_str] : snapshot_map) {
-                if (ptr_str == config::TOMBSTONE) {
-                    continue; 
-                }
-
-                VLogPointer ptr = VLogPointer::Decode(ptr_str);
-                if (ptr.size == 0) continue;
-
-                std::string actual_value = vlog_.Read(ptr);
-                result.push_back({k, actual_value});
+        for (size_t l = 1; l < levels_snapshot.size(); ++l) {
+            for (const auto& reader : levels_snapshot[l]) {
+                iters.push_back(std::make_unique<SSTableIteratorAdaptor>(reader));
             }
         }
 
-        return result;
+        return std::make_unique<MergingIterator>(std::move(iters));
     }
 
-    void PutBatch(const std::vector<std::pair<int, std::string>>& kvs) {
+    std::string ReadVLog(const VLogPointer& ptr) {
+        return vlog_.Read(ptr);
+    }
+
+    void PutBatch(const std::vector<std::pair<std::string, std::string>>& kvs) {
         if (kvs.empty()) return;
 
-        std::vector<std::pair<int, std::string>> ptr_kvs;
+        std::vector<std::pair<std::string, std::string>> ptr_kvs;
         ptr_kvs.reserve(kvs.size());
 
         {
@@ -252,7 +233,7 @@ public:
                 if (value == config::TOMBSTONE) {
                     ptr_kvs.push_back({key, config::TOMBSTONE});
                 } else {
-                    VLogPointer ptr = vlog_.Append(key, value);
+                    VLogPointer ptr = vlog_.Append(Slice(key), value);
                     ptr_kvs.push_back({key, ptr.Encode()});
                 }
             }
@@ -261,18 +242,25 @@ public:
         {
             std::unique_lock<std::mutex> lsm_lock(rw_mutex_);
             for (const auto& [key, encoded_ptr] : ptr_kvs) {
-                memtable_.insert(key, encoded_ptr, memtable_.RandomLevel());
+                memtable_.insert(Slice(key), encoded_ptr, memtable_.RandomLevel());
             }
             MaybeSwapMemtable(lsm_lock);
         }
     }
 
+    void Sync() {
+        std::unique_lock<std::mutex> lock(rw_mutex_);
+        if (!options_.disable_wal) {
+            wal_.Sync();
+        }
+        vlog_.Sync();
+    }
+
 private:
-    std::string InternalGetPtrNoLock(int key) {
+    std::string InternalGetPtrNoLock(const Slice& key) {
         auto node = memtable_.search(key); 
         if (node) return node->GetValue();
         
-        // 按时间从新到旧，遍历 Immutable MemTable 缓冲队列
         for (auto it = imm_queue_.rbegin(); it != imm_queue_.rend(); ++it) {
             auto imm_node = (*it)->mem->search(key);
             if (imm_node) return imm_node->GetValue();
@@ -286,11 +274,11 @@ private:
         
         for (int l = 1; l < config::K_NUM_LEVELS; ++l) {
             auto it = std::lower_bound(levels_[l].begin(), levels_[l].end(), key,
-                [](const std::shared_ptr<SSTableReader>& r, int k) { 
-                    return r->GetMaxKey() < k; 
+                [](const std::shared_ptr<SSTableReader>& r, const Slice& k) { 
+                    return Slice(r->GetMaxKey()) < k; 
                 });
             
-            if (it != levels_[l].end() && key >= (*it)->GetMinKey()) {
+            if (it != levels_[l].end() && key >= Slice((*it)->GetMinKey())) {
                 if (!(*it)->MightContain(key)) continue;
                 std::string v = (*it)->Search(key, &lru_cache_);
                 if (!v.empty()) return v;
@@ -320,7 +308,6 @@ private:
         }
     }
 
-    // 铁律 4：锁外进行 I/O 与大小判定，杜绝在全局写锁内调用 stat 系统调用
     void MajorCompaction() {
         bool has_work = true;
         while (has_work && !shutting_down_.load()) {
@@ -332,14 +319,12 @@ private:
                     level_snapshot = levels_[i];
                 }
 
-                // 锁外统计物理字节，0 阻塞前台
                 size_t current_level_bytes = 0;
                 for (const auto& r : level_snapshot) {
                     std::error_code ec;
                     current_level_bytes += std::filesystem::file_size(r->GetFilename(), ec);
                 }
 
-                    // 2. 字节倍增校验 (L1=10MB, L2=100MB, L3=1GB...)
                 bool trigger_compaction = false;
                 if (i == 0) {
                     if (level_snapshot.size() >= 4) trigger_compaction = true;
@@ -353,7 +338,8 @@ private:
                 has_work = true; 
                 std::vector<std::shared_ptr<SSTableReader>> inputs_curr;
                 std::vector<std::shared_ptr<SSTableReader>> inputs_next;
-                int min_k = INT_MAX, max_k = INT_MIN;
+                std::string min_k, max_k;
+                bool first_k = true;
 
                 {
                     std::unique_lock<std::mutex> lock(rw_mutex_);
@@ -361,7 +347,6 @@ private:
                         if (levels_[i].size() < 4) continue;
                         inputs_curr = levels_[i]; 
                     } else {
-                        // 挑选一半文件沉降，防止 I/O 尖刺
                         size_t num_to_merge = std::max<size_t>(2, levels_[i].size() / 2);
                         for (size_t n = 0; n < num_to_merge && n < levels_[i].size(); ++n) {
                             inputs_curr.push_back(levels_[i][n]);  
@@ -369,12 +354,18 @@ private:
                     }
                     
                     for (const auto& r : inputs_curr) {
-                        min_k = std::min(min_k, r->GetMinKey());
-                        max_k = std::max(max_k, r->GetMaxKey());
+                        if (first_k) {
+                            min_k = r->GetMinKey();
+                            max_k = r->GetMaxKey();
+                            first_k = false;
+                        } else {
+                            if (Slice(r->GetMinKey()) < Slice(min_k)) min_k = r->GetMinKey();
+                            if (Slice(r->GetMaxKey()) > Slice(max_k)) max_k = r->GetMaxKey();
+                        }
                     }
                     
                     for (const auto& r : levels_[i + 1]) {
-                        if (!(r->GetMaxKey() < min_k || r->GetMinKey() > max_k)) {
+                        if (!(Slice(r->GetMaxKey()) < Slice(min_k) || Slice(r->GetMinKey()) > Slice(max_k))) {
                             inputs_next.push_back(r);
                         }
                     }
@@ -438,7 +429,7 @@ private:
 
                     std::sort(lv_next.begin(), lv_next.end(), 
                         [](const std::shared_ptr<SSTableReader>& a, const std::shared_ptr<SSTableReader>& b) { 
-                            return a->GetMinKey() < b->GetMinKey(); 
+                            return Slice(a->GetMinKey()) < Slice(b->GetMinKey()); 
                         });
                 }
 
@@ -462,14 +453,13 @@ private:
         GCWork();
     }
 
-    // 铁律 3：纯被动触发 + 严格垃圾率门禁，杜绝 0 垃圾强行兜底
     void GCWork() {
         struct SampleItem {
-            int key;
+            std::string key;
             VLogPointer pos;
         };
         struct GCEntry {
-            int key;
+            std::string key;
             std::string value;
             VLogPointer current_pos;
         };
@@ -490,7 +480,6 @@ private:
             }
         }
 
-        // 积压段数少于 4 个时直接跳过，绝不打扰前台
         if (inactive_vlogs.size() < 4) return;
 
         std::sort(inactive_vlogs.begin(), inactive_vlogs.end());
@@ -520,16 +509,20 @@ private:
             samples.reserve(101);
 
             uint64_t current_offset = 0;
-            int key;
+            uint16_t key_len;
             uint32_t val_size;
 
-                // 采样子样本：每个段最多只探查头部 100 条数据，无锁磁盘 I/O
-            while (samples.size() < 100 && ::pread(fd, &key, sizeof(key), current_offset) == sizeof(key)) {
+            while (samples.size() < 100 && ::pread(fd, &key_len, sizeof(key_len), current_offset) == sizeof(key_len)) {
                 if (shutting_down_.load()) break;
-                if (::pread(fd, &val_size, sizeof(val_size), current_offset + sizeof(key)) != sizeof(val_size)) break;
-                uint32_t bytes_size = sizeof(key) + sizeof(val_size) + val_size;
-                VLogPointer currentpos = {fid, current_offset, val_size};
-                samples.push_back({key, currentpos});
+                if (::pread(fd, &val_size, sizeof(val_size), current_offset + sizeof(key_len)) != sizeof(val_size)) break;
+                
+                std::string k_str(key_len, '\0');
+                if (key_len > 0 && ::pread(fd, &k_str[0], key_len, current_offset + 6) != static_cast<ssize_t>(key_len)) break;
+
+                uint64_t val_offset = current_offset + 6 + key_len;
+                uint32_t bytes_size = 6 + key_len + val_size;
+                VLogPointer currentpos = {fid, val_offset, val_size};
+                samples.push_back({std::move(k_str), currentpos});
                 current_offset += bytes_size;
             }
             ::close(fd);
@@ -541,7 +534,7 @@ private:
                 std::unique_lock<std::mutex> sample_lock(rw_mutex_);
                 for (auto& sample : samples) {
                     bool is_stale = true;
-                    std::string index_ptr_str_ = InternalGetPtrNoLock(sample.key);
+                    std::string index_ptr_str_ = InternalGetPtrNoLock(Slice(sample.key));
                     if (!index_ptr_str_.empty() && index_ptr_str_ != config::TOMBSTONE) {
                         VLogPointer index_ptr = VLogPointer::Decode(index_ptr_str_);
                         if (index_ptr.file_id == sample.pos.file_id && index_ptr.offset == sample.pos.offset) {
@@ -558,7 +551,6 @@ private:
             }
         }
 
-        // 严格硬拦截：垃圾率不足阈值或低于 20% 时直接返回，彻底杜绝 0 垃圾无意义重写
         if (max_garbage_ratio < dynamic_threshold || best_victim_id == 0 || max_garbage_ratio <= 0.20) {
             return; 
         }
@@ -575,7 +567,7 @@ private:
         uint64_t chunk_bytes = 0;
         uint64_t chunk_start_offset = 0;
 
-        int key;
+        uint16_t key_len;
         uint32_t val_size;
         int valid_count = 0, stale_count = 0;
 
@@ -590,7 +582,7 @@ private:
             {
                 std::lock_guard<std::mutex> vlog_lock(vlog_mutex_);
                 for (const auto& item : batch) {
-                    new_ptrs.push_back(vlog_.Append(item.key, item.value));
+                    new_ptrs.push_back(vlog_.Append(Slice(item.key), item.value));
                 }
             }
 
@@ -599,14 +591,14 @@ private:
                 ThreadWrite::WriteBatch wal_batch;
 
                 for (size_t i = 0; i < batch.size(); ++i) {
-                    std::string double_check_str = InternalGetPtrNoLock(batch[i].key);
+                    std::string double_check_str = InternalGetPtrNoLock(Slice(batch[i].key));
                     if (!double_check_str.empty() && double_check_str != config::TOMBSTONE) {
                         VLogPointer check_ptr = VLogPointer::Decode(double_check_str);
                         
                         if (check_ptr.file_id == batch[i].current_pos.file_id && check_ptr.offset == batch[i].current_pos.offset) {
                             std::string new_ptr_encoded = new_ptrs[i].Encode();
                             wal_batch.entries.push_back({batch[i].key, new_ptr_encoded});
-                            memtable_.insert(batch[i].key, new_ptr_encoded, memtable_.RandomLevel());
+                            memtable_.insert(Slice(batch[i].key), new_ptr_encoded, memtable_.RandomLevel());
                             valid_count++;
                             continue;
                         }
@@ -614,26 +606,33 @@ private:
                     stale_count++;
                 }
 
-                if (!wal_batch.entries.empty()) {
+                if (!wal_batch.entries.empty() && !options_.disable_wal) {
                     wal_.LogBatch(wal_batch);
                 }
                 MaybeSwapMemtable(write_lock);
             }
             batch.clear();
-            std::this_thread::sleep_for(std::chrono::microseconds(200)); // 让路前台写入
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
         };
 
-        while (::pread(fd, &key, sizeof(key), current_offset) == sizeof(key)) {
+        while (::pread(fd, &key_len, sizeof(key_len), current_offset) == sizeof(key_len)) {
             if (shutting_down_.load()) break;
 
-            if (::pread(fd, &val_size, sizeof(val_size), current_offset + sizeof(key)) != sizeof(val_size)) break;
+            if (::pread(fd, &val_size, sizeof(val_size), current_offset + sizeof(key_len)) != sizeof(val_size)) break;
 
-            std::string value;
-            value.resize(val_size);
-            if (::pread(fd, &value[0], val_size, current_offset + sizeof(key) + sizeof(val_size)) != static_cast<ssize_t>(val_size)) break;
+            std::string key_str(key_len, '\0');
+            if (key_len > 0) {
+                if (::pread(fd, &key_str[0], key_len, current_offset + 6) != static_cast<ssize_t>(key_len)) break;
+            }
 
-            VLogPointer current_pos = {victim_id, current_offset, val_size};
-            uint32_t entry_bytes = sizeof(key) + sizeof(val_size) + val_size;
+            std::string value(val_size, '\0');
+            uint64_t val_offset = current_offset + 6 + key_len;
+            if (val_size > 0) {
+                if (::pread(fd, &value[0], val_size, val_offset) != static_cast<ssize_t>(val_size)) break;
+            }
+
+            VLogPointer current_pos = {victim_id, val_offset, val_size};
+            uint32_t entry_bytes = 6 + key_len + val_size;
             current_offset += entry_bytes;
             chunk_bytes += entry_bytes;
 
@@ -646,13 +645,13 @@ private:
             std::string indexed_ptr_str;
             {
                 std::unique_lock<std::mutex> lock(rw_mutex_);
-                indexed_ptr_str = InternalGetPtrNoLock(key);
+                indexed_ptr_str = InternalGetPtrNoLock(Slice(key_str));
             }
 
             if (!indexed_ptr_str.empty() && indexed_ptr_str != config::TOMBSTONE) {
                 VLogPointer indexed_ptr = VLogPointer::Decode(indexed_ptr_str);
                 if (indexed_ptr.file_id == current_pos.file_id && indexed_ptr.offset == current_pos.offset) {
-                    gc_batch.push_back({key, std::move(value), current_pos});
+                    gc_batch.push_back({std::move(key_str), std::move(value), current_pos});
                     if (gc_batch.size() >= 256) {
                         FlushGCBatch(gc_batch);
                     }
@@ -669,7 +668,6 @@ private:
         }
         ::close(fd);
 
-        // 仅在 vlog_mutex_ 保护下注销并删除文件，绝不持有 rw_mutex_ 阻塞前台读写
         {
             std::lock_guard<std::mutex> vlog_lock(vlog_mutex_);
             vlog_.RemoveSegment(victim_id);
@@ -691,7 +689,6 @@ private:
         return 0;
     }
 
-    // 铁律 2：Immutable 队列门禁放宽至 8，提供充足平滑写缓冲
     void MaybeSwapMemtable(std::unique_lock<std::mutex>& lsm_lock) {
         if (arena_.memory_usage() > config::K_MEMTABLE_THRESHOLD) {
             
@@ -722,13 +719,12 @@ private:
         }
     }
 
-    // 铁律 1：先挂载新 SSTable，再弹出 Immutable 队列，0 读黑洞
     void SingleFlushTask() {
         std::shared_ptr<ImmContext> imm_to_flush;
         {
             std::unique_lock<std::mutex> lock_(rw_mutex_);
             if (imm_queue_.empty()) return;
-            imm_to_flush = imm_queue_.front(); // 仅引用，绝不提前 pop
+            imm_to_flush = imm_queue_.front();
         }
 
         int new_file_id = file_id_.fetch_add(1);
@@ -739,15 +735,12 @@ private:
 
         {
             std::unique_lock<std::mutex> lock_(rw_mutex_);
-            
-            // 1. 先挂载至 L0，使新 SST 对读路径立即可见
             levels_[0].push_back(std::make_shared<SSTableReader>(name));
 
             VersionEdit vedt_;
             vedt_.AddFile(0, new_file_id, local_builder.GetFileSize(), local_builder.GetMinKey(), local_builder.GetMaxKey());
             manifest_manager_.LogAndApply(vedt_);
 
-            // 2. 新 SST 已可见，此时安全弹出 Immutable，消除读穿透黑洞
             imm_queue_.pop_front();
             imm_queue_size_.fetch_sub(1);
         }
@@ -757,14 +750,11 @@ private:
             put_cv_.notify_all();
         }
 
-        // 联动触发 Compaction 与被动 GC 检查
         low_pri_pool.Enqueue([this]() {
             MaybeTriggerCompaction();
             MaybeTriggerGC();
         });
     }
-
-    
 
 private:
     Options options_;
@@ -772,7 +762,6 @@ private:
 
     Arena arena_;
     skiplist memtable_;
-    //通过双端队列
     std::deque<std::shared_ptr<ImmContext>> imm_queue_;
     std::atomic<int> imm_queue_size_{0};
     
@@ -793,8 +782,8 @@ private:
 
     std::condition_variable put_cv_;       
     
-    ThreadPool high_pri_pool;//负责flush
-    ThreadPool low_pri_pool;//负责compaction和gc
+    ThreadPool high_pri_pool;
+    ThreadPool low_pri_pool;
     
     std::atomic<bool> shutting_down_;
     std::atomic<bool> is_compacting_;

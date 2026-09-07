@@ -1,4 +1,5 @@
 #pragma once
+#include "Slice.h"
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
@@ -19,20 +20,19 @@ class ThreadWrite{
         };
         //代表前台并发线程的单次写入请求包
         struct Writer {
-            int key;
+            std::string key;
             const std::string* value;
-            //leader修改,follower读取,无锁情况下需要保证一致性
             std::atomic<uint8_t> state{0};
             Writer* next{nullptr};
             std::mutex mutex_;
             std::condition_variable cv_;
-            Writer(int k,const std::string* v):key(k),value(v){}
+            Writer(const Slice& k, const std::string* v) : key(k.ToString()), value(v) {}
         };
         
         //  wal组提交使用的批量数据载体
         struct WriteBatch {
             struct Entry {
-                int key;
+                std::string key;
                 std::string value;
             };
             std::vector<Entry> entries;

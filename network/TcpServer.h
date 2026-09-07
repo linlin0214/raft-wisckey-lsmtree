@@ -41,4 +41,5 @@ public:
     void SetMessageCallback(MessageCallback cb) { message_callback_ = std::move(cb); }
 
     void Start();
+    void Stop(); // 停止监听并安全释放全场客户端连接
 };

@@ -1,4 +1,5 @@
 #include "protocol/wire_protocol.h"
+#include "lsmtree/src/Slice.h"
 #include <iostream>
 #include <string>
 #include <vector>
@@ -60,6 +61,7 @@ void BenchmarkWorker(std::string ip, uint16_t initial_port, int thread_id,
     
     uint16_t current_port = initial_port;
     uint32_t local_counter = 0;
+    uint64_t client_req_id = 0;
     
     std::mt19937 rng(1337 + thread_id);
     std::uniform_int_distribution<uint32_t> dist(1, 100000000);
@@ -94,10 +96,13 @@ void BenchmarkWorker(std::string ip, uint16_t initial_port, int thread_id,
                      thread_id, ip, current_port, value_size);
 
         while (!stop_benchmark.load(std::memory_order_relaxed)) {
-            uint64_t target_key = random_key ? dist(rng) : (static_cast<uint64_t>(thread_id) * 100000000 + (++local_counter));
+            std::string target_key = random_key 
+                ? ("rand_key_" + std::to_string(dist(rng))) 
+                : ("seq_key_" + std::to_string(thread_id) + "_" + std::to_string(++local_counter));
 
+            uint64_t cur_req_id = ++client_req_id;
             std::string write_packet = raft_node::WireProtocol::Serialize(
-                raft_node::Opcode::PUT_RAW, target_key, value_payload
+                raft_node::Opcode::PUT_RAW, Slice(target_key), value_payload, cur_req_id
             );
 
             auto t_start = std::chrono::high_resolution_clock::now();
@@ -107,29 +112,33 @@ void BenchmarkWorker(std::string ip, uint16_t initial_port, int thread_id,
             const size_t kHeaderSize = raft_node::WireProtocol::kHeaderSize;
             if (!read_n(fd, read_buf.data(), kHeaderSize)) break;
 
-            auto parsed_header = raft_node::WireProtocol::ParseHeader(std::string_view(read_buf.data(), kHeaderSize));
+            auto parsed_header = raft_node::WireProtocol::ParseHeaderWithProbe(std::string_view(read_buf.data(), kHeaderSize));
             if (!parsed_header.has_value()) {
                 spdlog::error("[Worker-{}] 帧头解包失败，重置连接！", thread_id);
                 break;
             }
 
-            uint32_t val_len = parsed_header->val_len;
-            if (val_len + kHeaderSize > read_buf.size()) {
-                read_buf.resize(val_len + kHeaderSize + 4096);
+            uint32_t body_len = parsed_header->first.body_len;
+            if (body_len + kHeaderSize > read_buf.size()) {
+                read_buf.resize(body_len + kHeaderSize + 4096);
             }
 
-            if (!read_n(fd, read_buf.data() + kHeaderSize, val_len)) break;
+            if (!read_n(fd, read_buf.data() + kHeaderSize, body_len)) break;
 
             auto t_end = std::chrono::high_resolution_clock::now();
             uint32_t latency_us = static_cast<uint32_t>(
                 std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start).count()
             );
 
-            std::string_view body_reply(read_buf.data() + kHeaderSize, val_len);
+            std::string_view full_packet(read_buf.data(), kHeaderSize + body_len);
+            auto full_parsed = raft_node::WireProtocol::Parse(full_packet);
+            if (!full_parsed.has_value()) break;
+
+            auto [reply_hdr, ret_key, body_reply, skip] = *full_parsed;
 
             if (body_reply == "OK_COMMIT") {
                 total_ops.fetch_add(1, std::memory_order_relaxed);
-                total_bytes.fetch_add(write_packet.size() + kHeaderSize + val_len, std::memory_order_relaxed);
+                total_bytes.fetch_add(write_packet.size() + kHeaderSize + body_len, std::memory_order_relaxed);
                 out_latencies.push_back(latency_us);
             } 
             else if (body_reply.rfind("REJECT", 0) == 0) {
@@ -216,7 +225,6 @@ int main(int argc, char* argv[]) {
     auto end_time = std::chrono::steady_clock::now();
     double total_elapsed_sec = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count() / 1000.0;
 
-    // 安全合并所有线程的延迟数据
     std::vector<uint32_t> all_latencies;
     size_t total_records = 0;
     for (const auto& vec : thread_latencies) {

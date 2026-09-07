@@ -1,6 +1,7 @@
 #pragma once
 
 #include "lsmtree/src/RaftStorageAdapter.h"
+#include "lsmtree/src/Slice.h"
 #include "RaftCore.h"
 #include "protocol/RaftRpc.h"
 #include "network/EventLoop.h"
@@ -36,25 +37,23 @@ public:
         uint64_t last_applied;
     };
     NodeStatus GetStatus();
+    
     struct Peer {
         uint32_t id;
         std::string ip;
         uint16_t port;
         std::shared_ptr<RpcClient> client;
-        //默认构造
         std::weak_ptr<Connection> outbound_conn{};
         std::weak_ptr<Connection> inbound_conn{};
 
         std::shared_ptr<Connection> GetActiveConnection() const {
-            // 尝试提升 outbound_conn
-            if(auto conn = outbound_conn.lock()){
-                if(conn -> IsConnected()){
-                    return conn; //返回强引用
+            if (auto conn = outbound_conn.lock()) {
+                if (conn->IsConnected()) {
+                    return conn;
                 }
             }
-            // 尝试提升 inbound_conn
-            if(auto conn = inbound_conn.lock()){
-                if(conn -> IsConnected()){
+            if (auto conn = inbound_conn.lock()) {
+                if (conn->IsConnected()) {
                     return conn;
                 }
             }
@@ -63,9 +62,8 @@ public:
     };
 
 public:
-    //  快照配置参数：适配 4KB 载荷与高 QPS 目标的高门限设计
-    static constexpr uint64_t kSnapshotCountThreshold = 500000; // 50万条日志 (~2GB)
-    static constexpr uint64_t kSnapshotIntervalSec   = 300;    // 300秒 (5分钟)
+    static constexpr uint64_t kSnapshotCountThreshold = 500000;
+    static constexpr uint64_t kSnapshotIntervalSec   = 300;
 
 public:
     RaftNode(
@@ -87,17 +85,30 @@ public:
     );
 
     bool Propose(
-        int32_t key,
+        const Slice& key,
         std::string_view value,
-        const std::shared_ptr<Connection>& client
+        const std::shared_ptr<Connection>& client,
+        uint64_t req_id = 0
     );
 
     bool ProposeRead(
-        int32_t key,
-        const std::shared_ptr<Connection>& client
+        const Slice& key,
+        const std::shared_ptr<Connection>& client,
+        uint64_t req_id = 0
     );
 
 public:
+    void HandlePreVote(
+        const std::shared_ptr<Connection>& conn,
+        uint64_t req_id,
+        const raft_rpc::PreVoteArgs& args
+    );
+
+    void HandlePreVoteReply(
+        uint64_t req_id,
+        const raft_rpc::PreVoteReply& reply
+    );
+
     void HandleAppendEntries(
         const std::shared_ptr<Connection>& conn,
         uint64_t req_id,
@@ -138,15 +149,16 @@ public:
         return core_ ? core_->GetLeaderId() : RaftCore::kNoLeader;
     }
 
+    void GracefulShutdown(std::function<void()> on_complete);
+
 private:
     void OnTick();
     void ScheduleCheckAndAdvance();
     void DoCheckAndAdvance();
     void CheckAndAdvance();
     void OnPersistFinished(Ready rd, AdvanceState state);
-    void StorageThreadLoop(); // 内嵌的后台落盘线程函数
+    void StorageThreadLoop();
 
-    //  快照驱动与检测函数
     void CheckAndTriggerSnapshot(uint64_t current_applied);
     void TriggerSnapshot(uint64_t compact_index);
 
@@ -154,34 +166,58 @@ private:
     void UpdateInboundConnection(uint32_t peer_id, const std::shared_ptr<Connection>& conn);
 
 private:
-    EventLoop* loop_;                       // 挂载的 EventLoop 核心控制面
-    uint32_t node_id_;                      // 当前节点 ID
-    raft_rpc::RaftDispatcher* dispatcher_;  // 网络协议路由分发器
+    struct PendingClientRead {
+        std::string ctx;
+        std::string key;
+        uint64_t client_req_id{0};
+        std::weak_ptr<Connection> conn;
+        std::chrono::steady_clock::time_point start_time;
+    };
+
+    struct WaitingApplyRead {
+        uint64_t read_index{0};
+        std::string key;
+        uint64_t client_req_id{0};
+        std::weak_ptr<Connection> conn;
+    };
+
+    void ProcessReadStates(const std::vector<ReadState>& read_states);
+    void CheckWaitingAppliedReads(uint64_t current_applied);
+    void CleanupExpiredReads();
+
+    std::atomic<uint64_t> next_read_ctx_id_{1};
+    std::unordered_map<std::string, PendingClientRead> pending_client_reads_;
+    std::vector<WaitingApplyRead> waiting_applied_reads_;
+
+private:
+    EventLoop* loop_;
+    uint32_t node_id_;
+    raft_rpc::RaftDispatcher* dispatcher_;
     
-    std::vector<Peer> peers_;               // Peer 节点大盘
-    std::unique_ptr<RaftCore> core_;        // 内存共识大脑
-    std::mutex core_mtx_;                   // 保护 core_ 的互斥锁
+    std::vector<Peer> peers_;
+    std::unique_ptr<RaftCore> core_;
+    std::mutex core_mtx_;
 
-    RaftStorageAdapter storage_adapter_;    // 持久化存储与 LSM-Tree 适配器
+    RaftStorageAdapter storage_adapter_;
 
-    // 后台专职落盘线程与生产者-消费者队列
     std::thread storage_thread_;
     std::mutex storage_queue_mtx_;
     std::condition_variable storage_cv_;
     std::queue<Ready> storage_queue_;
     std::atomic<bool> storage_running_{false};
 
-    std::atomic<bool> is_ready_scheduled_{false}; // 调度去重标志位
-    std::atomic<bool> is_persisting_{false};      // 落盘顺序屏障
-    std::atomic<bool> is_snapshotting_{false};    // 快照并发屏障
+    std::atomic<bool> is_ready_scheduled_{false};
+    std::atomic<bool> is_persisting_{false};
+    std::atomic<bool> is_snapshotting_{false};
 
-    // 快照水位与时间状态追踪
     uint64_t last_snapshot_index_{0};
     uint64_t last_snapshot_time_sec_{0};
 
-    TimerQueue tick_timer_;                 // Raft 逻辑 Tick 定时器
+    TimerQueue tick_timer_;
 
-    std::mutex client_mtx_;                 // 保护 Client ACK 映射表
-    std::unordered_map<uint64_t, std::shared_ptr<Connection>> client_wait_list_; // log_index -> Client Conn
-    std::unordered_map<uint64_t, std::weak_ptr<Connection>> pending_replies_;      // req_id -> Inbound Conn
+    std::mutex client_mtx_;
+    std::unordered_map<uint64_t, std::shared_ptr<Connection>> client_wait_list_;
+    std::unordered_map<uint64_t, std::weak_ptr<Connection>> pending_replies_;
+
+    std::atomic<bool> is_shutting_down_{false};
 };

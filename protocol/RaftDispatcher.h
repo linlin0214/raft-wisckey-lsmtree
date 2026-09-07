@@ -11,7 +11,8 @@ namespace raft_rpc {
 
 class RaftDispatcher {
 public:
-    // 向上层 Raft 核心暴露，如果不使用回调Dispatcher 必须持有一个 RaftNode 的指针或引用
+    using PreVoteRequestCallback   = std::function<void(const std::shared_ptr<Connection>&, uint64_t req_id, const PreVoteArgs&)>;
+    using PreVoteReplyCallback     = std::function<void(uint64_t req_id, const PreVoteReply&)>;
     using VoteRequestCallback      = std::function<void(const std::shared_ptr<Connection>&, uint64_t req_id, const RequestVoteArgs&)>;
     using VoteReplyCallback        = std::function<void(uint64_t req_id, const RequestVoteReply&)>;
     using HeartbeatRequestCallback = std::function<void(const std::shared_ptr<Connection>&, uint64_t req_id, const AppendEntriesArgs&)>;
@@ -20,6 +21,8 @@ public:
     using SnapshotReplyCallback    = std::function<void(uint64_t req_id, const InstallSnapshotReply&)>;
 
 private:
+    PreVoteRequestCallback   prevote_req_cb_;
+    PreVoteReplyCallback     prevote_reply_cb_;
     VoteRequestCallback      vote_req_cb_;
     VoteReplyCallback        vote_reply_cb_;
     HeartbeatRequestCallback heartbeat_req_cb_;   
@@ -31,12 +34,11 @@ public:
     RaftDispatcher() = default;
     ~RaftDispatcher() = default;
 
-    // 禁用拷贝构造与赋值运算符
     RaftDispatcher(const RaftDispatcher&) = delete;
     RaftDispatcher& operator=(const RaftDispatcher&) = delete;
 
-    // 注册业务触点
-    //std::move 的本质是：以极低的开销，将 cb 内部持有的“如堆内存指针的所有权”转移给成员变量，而不是深拷贝一份新的资源
+    void SetPreVoteRequestCallback(PreVoteRequestCallback cb) { prevote_req_cb_ = std::move(cb); }
+    void SetPreVoteReplyCallback(PreVoteReplyCallback cb) { prevote_reply_cb_ = std::move(cb); }
     void SetVoteRequestCallback(VoteRequestCallback cb) { vote_req_cb_ = std::move(cb); }
     void SetVoteReplyCallback(VoteReplyCallback cb) { vote_reply_cb_ = std::move(cb); }
     void SetHeartbeatRequestCallback(HeartbeatRequestCallback cb) { heartbeat_req_cb_ = std::move(cb); } 
@@ -44,13 +46,11 @@ public:
     void SetSnapshotRequestCallback(SnapshotRequestCallback cb) { snapshot_req_cb_ = std::move(cb); }
     void SetSnapshotReplyCallback(SnapshotReplyCallback cb) { snapshot_reply_cb_ = std::move(cb); }
 
-    // 控制反转核心枢纽
     void OnMessage(const std::shared_ptr<Connection>& conn, Buffer* buf) {
-        // 1. 循环调用 Codec 精准切包，彻底解决高并发 TCP 粘包问题
         while (true) {
             auto packet = Codec::Parse(buf);
             if (!packet.has_value()) {
-                break; // 半包发生，或 Buffer 被吃空，安全退出
+                break;
             }
 
             uint8_t opcode = packet->header.opcode;
@@ -59,9 +59,26 @@ public:
 
             spdlog::debug("[Dispatcher] 捕获网络报文 Opcode: 0x{:02X}, ReqID: {}", opcode, req_id);
 
-            // 捕获反序列化与回调异常，保护 EventLoop 线程
             try {
                 switch (opcode) {
+                    case RaftOpcode::kPreVote: {
+                        if (prevote_req_cb_) {
+                            PreVoteArgs args = PreVoteArgs::Deserialize(body);
+                            prevote_req_cb_(conn, req_id, args);
+                        } else {
+                            spdlog::warn("[Dispatcher] 收到 kPreVote 但未注册 prevote_req_cb_！");
+                        }
+                        break;
+                    }
+                    case RaftOpcode::kPreVoteReply: {
+                        if (prevote_reply_cb_) {
+                            PreVoteReply reply = PreVoteReply::Deserialize(body);
+                            prevote_reply_cb_(req_id, reply);
+                        } else {
+                            spdlog::warn("[Dispatcher] 收到 kPreVoteReply 但未注册 prevote_reply_cb_！");
+                        }
+                        break;
+                    }
                     case RaftOpcode::kRequestVote: {
                         if (vote_req_cb_) {
                             RequestVoteArgs args = RequestVoteArgs::Deserialize(body);

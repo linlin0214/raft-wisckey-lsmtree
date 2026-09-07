@@ -36,9 +36,14 @@ public:
     uint64_t GetLastLogIndex() const { return raft_log_.GetLastIndex(); }
     uint64_t GetStabledIndex() const { return raft_log_.stabled_index(); }
     uint64_t GetLastApplied() const { return raft_log_.last_applied(); }
+    // 注册线性一致性读请求，成功时广播心跳确认多数派
+    bool ProposeReadIndex(const std::string& ctx);
+    // 优雅停机阶段 2：主动退位让渡领导权
+    void StepDown(uint64_t new_term);
 
 private:
     void BecomeFollower(uint64_t term, int32_t voted_for);
+    void BecomePreCandidate();
     void BecomeCandidate();
     void BecomeLeader();
 
@@ -46,10 +51,12 @@ private:
     void TickElection();
     void TickHeartbeat();
 
-    void HandleAppendEntries(uint32_t from, uint64_t req_id, const std::string& payload);
-    void HandleAppendEntriesReply(uint32_t from, uint64_t req_id, const std::string& payload);
+    void HandlePreVote(uint32_t from, uint64_t req_id, const std::string& payload);
+    void HandlePreVoteReply(uint32_t from, uint64_t req_id, const std::string& payload);
     void HandleRequestVote(uint32_t from, uint64_t req_id, const std::string& payload);
     void HandleRequestVoteReply(uint32_t from, uint64_t req_id, const std::string& payload);
+    void HandleAppendEntries(uint32_t from, uint64_t req_id, const std::string& payload);
+    void HandleAppendEntriesReply(uint32_t from, uint64_t req_id, const std::string& payload);
     void HandleInstallSnapshot(uint32_t from, uint64_t req_id, const std::string& payload);
     void HandleInstallSnapshotReply(uint32_t from, uint64_t req_id, const std::string& payload);
 
@@ -60,7 +67,10 @@ private:
 
     void EnqueueMessage(uint32_t to, raft_rpc::RaftOpcode opcode, uint64_t req_id, const std::string& payload);
     
-    uint64_t GenerateReqId() { return next_req_id_++; }//reqid它是离散的、只要求全局唯一，不要求连续
+    uint64_t GenerateReqId() {
+        return (static_cast<uint64_t>(node_id_) << 32) | (next_req_id_++);
+    }
+
 
 private:
     uint32_t node_id_;                   // 本节点 ID
@@ -76,7 +86,8 @@ private:
 
     RaftLog raft_log_;                   // 内存日志数组与水位线抽象
 
-    std::unordered_set<uint32_t> voted_peers_; // Candidate 收集到的赞成票集合
+    std::unordered_set<uint32_t> pre_voted_peers_; // Pre-Vote 阶段赞成票集合
+    std::unordered_set<uint32_t> voted_peers_;     // 正式选举阶段赞成票集合
     int election_elapsed_{0};             // 选举计时器流逝 tick 数
     int heartbeat_elapsed_{0};            // 心跳计时器流逝 tick 数
     int randomized_election_timeout_{0};  // 随机选举超时阈值
@@ -87,4 +98,7 @@ private:
     std::vector<OutboundMessage> pending_messages_; // 待投递的网络出站 RPC 队列
     std::mt19937 rng_;                             // 随机数生成引擎
     uint64_t next_req_id_{1};                      // 全局递增 req_id 发号器
+
+    std::vector<ReadIndexRequest> pending_read_indexes_; // 等待多数派心跳 ACK 的读请求
+    std::vector<ReadState> ready_read_states_;           // 多数派已确认、待输出给 Ready 的读状态
 };

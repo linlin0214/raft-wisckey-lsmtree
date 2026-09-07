@@ -73,10 +73,10 @@ public:
             iss >> op;
 
             if (op == '+') {
-                int level, file_num, smallest, largest;
+                int level, file_num;
                 size_t size;
-                if (iss >> level >> file_num >> size >> smallest >> largest) {
-                    // 以 "层级_文件号" 作为存活映射键
+                std::string hex_small, hex_large;
+                if (iss >> level >> file_num >> size >> hex_small >> hex_large) {
                     live_files.insert(std::to_string(level) + "_" + std::to_string(file_num));
                 }
             } else if (op == '-') {
@@ -114,7 +114,7 @@ public:
                 });
             } else {
                 std::sort(db_levels[i].begin(), db_levels[i].end(), [](const std::shared_ptr<SSTableReader>& a, const std::shared_ptr<SSTableReader>& b) {
-                    return a->GetMinKey() < b->GetMinKey();
+                    return Slice(a->GetMinKey()) < Slice(b->GetMinKey());
                 });
             }
         }

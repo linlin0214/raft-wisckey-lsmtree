@@ -2,6 +2,7 @@
 #include "protocol/RaftDispatcher.h"
 #include "protocol/Codec.h"
 #include "protocol/wire_protocol.h"
+#include "lsmtree/src/Slice.h"
 #include <spdlog/spdlog.h>
 
 inline uint64_t GetCurrentSec() {
@@ -14,6 +15,7 @@ RaftNode::NodeStatus RaftNode::GetStatus() {
     std::string role_str = "Follower";
     if (core_->GetRole() == RaftRole::kLeader) role_str = "Leader";
     else if (core_->GetRole() == RaftRole::kCandidate) role_str = "Candidate";
+    else if (core_->GetRole() == RaftRole::kPreCandidate) role_str = "PreCandidate";
 
     return NodeStatus{
         node_id_,
@@ -34,19 +36,15 @@ RaftNode::RaftNode(EventLoop* loop, uint32_t node_id, const std::vector<uint32_t
 
     core_ = std::make_unique<RaftCore>(node_id_, peer_ids);
 
-    //  1. 从磁盘加载持久化状态与 WAL 日志
     HardState hs = storage_adapter_.GetHardState();
     auto logs = storage_adapter_.LoadLogs();
 
-    //  2. 完全对齐 RaftCore::Restore(const HardState& hs, std::vector<raft_rpc::LogEntry> logs)
     core_->Restore(hs, std::move(logs));
 
-    //  3. 加载快照元数据以维护 RaftNode 的快照水位
     Snapshot snap = storage_adapter_.GetSnapshot();
     last_snapshot_index_ = snap.meta.index;
     last_snapshot_time_sec_ = GetCurrentSec();
 
-    //  4. 启动内嵌的后台落盘线程
     storage_running_ = true;
     storage_thread_ = std::thread(&RaftNode::StorageThreadLoop, this);
 
@@ -56,7 +54,6 @@ RaftNode::RaftNode(EventLoop* loop, uint32_t node_id, const std::vector<uint32_t
 }
 
 RaftNode::~RaftNode() {
-    // 通知后台落盘线程退出并等待回收
     storage_running_ = false;
     {
         std::lock_guard<std::mutex> lock(storage_queue_mtx_);
@@ -92,7 +89,8 @@ void RaftNode::Start() {
 void RaftNode::SendOutboundMessage(const OutboundMessage& msg) {
     bool is_reply = (msg.opcode == raft_rpc::RaftOpcode::kRequestVoteReply ||
                      msg.opcode == raft_rpc::RaftOpcode::kAppendEntriesReply ||
-                     msg.opcode == raft_rpc::RaftOpcode::kInstallSnapshotReply);
+                     msg.opcode == raft_rpc::RaftOpcode::kInstallSnapshotReply ||
+                     msg.opcode == raft_rpc::RaftOpcode::kPreVoteReply);
 
     std::shared_ptr<Connection> reply_conn = nullptr;
 
@@ -148,10 +146,7 @@ void RaftNode::DoCheckAndAdvance() {
     is_ready_scheduled_.store(false, std::memory_order_release);
 }
 
-
 void RaftNode::CheckAndAdvance() {
-    // 1. 尝试抢占落盘屏障：如果后台 StorageThread 正在 Persist，暂不 PopReady
-    // 保护 storage_queue_ 深度严格 <= 1
     bool expected = false;
     if (!is_persisting_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
         return; 
@@ -172,13 +167,16 @@ void RaftNode::CheckAndAdvance() {
         return;
     }
 
-    // 2. 网络 RPC 永远第一时间无条件发送（心跳直通网卡，绝对零延迟！）
     for (const auto& msg : rd.messages) {
         SendOutboundMessage(msg);
     }
     rd.messages.clear();
 
-    // 3. 检查是否有真正的物理磁盘写任务
+    if (!rd.read_states.empty()) {
+        ProcessReadStates(rd.read_states);
+        rd.read_states.clear();
+    }
+
     bool has_disk_work = !rd.entries.empty() || 
                          !rd.committed_entries.empty() || 
                          rd.hard_state.has_value() || 
@@ -188,9 +186,7 @@ void RaftNode::CheckAndAdvance() {
         std::lock_guard<std::mutex> lock(storage_queue_mtx_);
         storage_queue_.push(std::move(rd));
         storage_cv_.notify_one();
-        // is_persisting_ 保持为 true，由 OnPersistFinished 执行完毕后释放
     } else {
-        // 纯内存任务，立刻 Advance 并释放屏障
         {
             std::lock_guard<std::mutex> lock(core_mtx_);
             core_->Advance(0, 0);
@@ -199,25 +195,25 @@ void RaftNode::CheckAndAdvance() {
     }
 }
 
-// 内嵌后台落盘线程：专职处理磁盘 WAL / DB 写入 / Snapshot 落盘
 void RaftNode::StorageThreadLoop() {
-    while (storage_running_) {
+    while (true) {
         Ready rd;
         {
             std::unique_lock<std::mutex> lock(storage_queue_mtx_);
             storage_cv_.wait(lock, [this] {
                 return !storage_queue_.empty() || !storage_running_;
             });
-            if (!storage_running_ && storage_queue_.empty()) break;
+
+            if (!storage_running_ && storage_queue_.empty()) {
+                break;
+            }
 
             rd = std::move(storage_queue_.front());
             storage_queue_.pop();
         }
 
-        // 物理落盘 (若 rd 含有 snapshot，适配器内部自动做 SST 导出与 snap 元数据存储)
         AdvanceState state = storage_adapter_.PersistReady(rd);
 
-        // 切回 EventLoop 线程回调
         if (loop_) {
             std::shared_ptr<RaftNode> self = nullptr;
             try {
@@ -232,23 +228,64 @@ void RaftNode::StorageThreadLoop() {
     }
 }
 
+void RaftNode::GracefulShutdown(std::function<void()> on_complete) {
+    if (is_shutting_down_.exchange(true)) {
+        return;
+    }
+
+    spdlog::warn("[RaftNode {}] 启动优雅停机流程...", node_id_);
+
+    {
+        std::lock_guard<std::mutex> lock(core_mtx_);
+        if (core_->IsLeader()) {
+            core_->StepDown(core_->GetCurrentTerm() + 1);
+        }
+    }
+
+    ScheduleCheckAndAdvance();
+
+    std::thread drain_thread([this, on_complete = std::move(on_complete)]() {
+        spdlog::info("[RaftNode {}] 开始排空持久化任务队列 (当前积压: {})...", 
+                     node_id_, storage_queue_.size());
+
+        storage_running_.store(false);
+        {
+            std::lock_guard<std::mutex> lock(storage_queue_mtx_);
+            storage_cv_.notify_all();
+        }
+
+        if (storage_thread_.joinable()) {
+            storage_thread_.join();
+        }
+
+        spdlog::info("[RaftNode {}] 正在执行全引擎物理 ForceSync...", node_id_);
+        storage_adapter_.ForceSync();
+
+        spdlog::info("[RaftNode {}] 存储管线排空完成，调度主循环退出。", node_id_);
+
+        if (loop_) {
+            loop_->QueueInLoop(on_complete);
+        }
+    });
+    drain_thread.detach();
+}
+
 void RaftNode::OnPersistFinished(Ready rd, AdvanceState state) {
     uint64_t current_applied = 0;
 
-    // 1. 推进 Raft 核心水位，RaftCore 在 Advance 内部会自动释放已落盘的 unstable 内存
     {
         std::lock_guard<std::mutex> lock(core_mtx_);
         core_->Advance(state.stabled_index, state.applied_index);
         current_applied = state.applied_index;
     }
 
-    // 若当前 Ready 包含 Snapshot，说明 StorageAdapter 已完成物理快照落盘，解除快照屏障
+    CheckWaitingAppliedReads(current_applied);
+
     if (rd.snapshot.is_valid) {
         is_snapshotting_.store(false, std::memory_order_release);
         spdlog::info("[RaftNode {}] 后台快照落盘成功完成, index: {}", node_id_, rd.snapshot.meta.index);
     }
 
-    // 2. 给 Client 发送 ACK 并清理等待映射表
     for (const auto& entry : rd.committed_entries) {
         if (entry.index > state.applied_index) break;
 
@@ -261,7 +298,6 @@ void RaftNode::OnPersistFinished(Ready rd, AdvanceState state) {
                 client_wait_list_.erase(it);
             }
 
-            // 定期兜底清理异常丢弃的 pending_replies_，防止隐式内存泄露
             if (pending_replies_.size() > 10000) {
                 pending_replies_.clear();
             }
@@ -269,16 +305,17 @@ void RaftNode::OnPersistFinished(Ready rd, AdvanceState state) {
 
         if (client_conn && client_conn->IsConnected()) {
             auto parsed = raft_node::WireProtocol::Parse(entry.data);
-            int32_t raw_key = parsed ? std::get<0>(*parsed).key : 0;
-            std::string reply = raft_node::WireProtocol::Serialize(raft_node::Opcode::PUT_RAW, raw_key, "OK_COMMIT");
-            client_conn->Send(reply);
+            if (parsed.has_value()) {
+                auto [header, key_view, val_view, skip] = *parsed;
+                std::string reply = raft_node::WireProtocol::Serialize(
+                    raft_node::Opcode::PUT_RAW, Slice(key_view), "OK_COMMIT", header.req_id
+                );
+                client_conn->Send(reply);
+            }
         }
     }
 
-    // 3. 多维快照门限检测
     CheckAndTriggerSnapshot(current_applied);
-
-    // 4. 正确重置 Persist 屏障并检查追帧
     is_persisting_.store(false, std::memory_order_release);
 
     bool has_ready = false;
@@ -291,10 +328,9 @@ void RaftNode::OnPersistFinished(Ready rd, AdvanceState state) {
     }
 }
 
-//  检查是否达到快照门限
 void RaftNode::CheckAndTriggerSnapshot(uint64_t current_applied) {
     if (is_snapshotting_.load(std::memory_order_relaxed)) {
-        return; // 正在生成快照中，跳过
+        return;
     }
 
     uint64_t uncompacted_count = (current_applied > last_snapshot_index_) ? (current_applied - last_snapshot_index_) : 0;
@@ -308,13 +344,11 @@ void RaftNode::CheckAndTriggerSnapshot(uint64_t current_applied) {
     }
 }
 
-//  触发快照：从 StorageAdapter 获取 Term，完全不依赖非公有 RaftCore 接口
 void RaftNode::TriggerSnapshot(uint64_t compact_index) {
     if (compact_index <= last_snapshot_index_) {
         return;
     }
 
-    // 从存储适配器安全获取该 Index 的 Term
     uint64_t compact_term = storage_adapter_.GetLogTerm(compact_index);
 
     is_snapshotting_.store(true, std::memory_order_release);
@@ -323,7 +357,6 @@ void RaftNode::TriggerSnapshot(uint64_t compact_index) {
 
     spdlog::info("[RaftNode {}] 触发快照生成, compact_index: {}, compact_term: {}", node_id_, compact_index, compact_term);
 
-    // 构造 Snapshot Ready，塞入后台队列异步落盘（零卡顿 EventLoop）
     Ready snap_rd;
     snap_rd.snapshot.meta.index = compact_index;
     snap_rd.snapshot.meta.term = compact_term;
@@ -347,6 +380,8 @@ void RaftNode::OnTick() {
         core_->Tick();
     }
 
+    CleanupExpiredReads();
+
     ScheduleCheckAndAdvance();
     tick_timer_.Reset(10);
 }
@@ -358,6 +393,33 @@ void RaftNode::UpdateInboundConnection(uint32_t peer_id, const std::shared_ptr<C
             break;
         }
     }
+}
+
+void RaftNode::HandlePreVote(const std::shared_ptr<Connection>& conn, uint64_t req_id, const raft_rpc::PreVoteArgs& args) {
+    spdlog::info("[RaftNode {}] 收到来自 Node {} 的 PreVote (Term: {}, req_id: {})", 
+                 node_id_, args.candidate_id, args.term, req_id);
+
+    UpdateInboundConnection(args.candidate_id, conn);
+    {
+        std::lock_guard<std::mutex> cl(client_mtx_);
+        pending_replies_[req_id] = conn;
+    }
+    {
+        std::lock_guard<std::mutex> lock(core_mtx_);
+        core_->Step(args.candidate_id, raft_rpc::RaftOpcode::kPreVote, req_id, args.Serialize());
+    }
+    ScheduleCheckAndAdvance();
+}
+
+void RaftNode::HandlePreVoteReply(uint64_t req_id, const raft_rpc::PreVoteReply& reply) {
+    spdlog::info("[RaftNode {}] 收到来自 Node {} 的 PreVoteReply (granted: {}, term: {})", 
+                 node_id_, reply.voter_id, reply.vote_granted, reply.term);
+
+    {
+        std::lock_guard<std::mutex> lock(core_mtx_);
+        core_->Step(reply.voter_id, raft_rpc::RaftOpcode::kPreVoteReply, req_id, reply.Serialize());
+    }
+    ScheduleCheckAndAdvance();
 }
 
 void RaftNode::HandleAppendEntries(const std::shared_ptr<Connection>& conn, uint64_t req_id, const raft_rpc::AppendEntriesArgs& args) {
@@ -431,11 +493,15 @@ void RaftNode::HandleInstallSnapshotReply(uint64_t req_id, const raft_rpc::Insta
     ScheduleCheckAndAdvance();
 }
 
-bool RaftNode::Propose(int32_t key, std::string_view val, const std::shared_ptr<Connection>& client_conn) {
+bool RaftNode::Propose(const Slice& key, std::string_view val, const std::shared_ptr<Connection>& client_conn, uint64_t req_id) {
+    if (is_shutting_down_.load(std::memory_order_relaxed)) {
+        return false;
+    }
     std::string cmd = raft_node::WireProtocol::Serialize(
         raft_node::Opcode::PUT_RAW,
         key,
-        val
+        val,
+        req_id
     );
 
     uint64_t assigned_index = 0;
@@ -447,7 +513,6 @@ bool RaftNode::Propose(int32_t key, std::string_view val, const std::shared_ptr<
             return false;
         }
 
-        // 🚀 高水位硬拦截：未提交日志超过 10000 条（约 40MB）直接拒绝，防止 OOM
         uint64_t uncommitted_count = core_->GetLastLogIndex() - core_->GetCommitIndex();
         if (uncommitted_count > 10000) {
             return false;
@@ -462,7 +527,6 @@ bool RaftNode::Propose(int32_t key, std::string_view val, const std::shared_ptr<
 
     {
         std::lock_guard<std::mutex> cl(client_mtx_);
-        // 防御性清理悬挂连接
         if (client_wait_list_.size() > 20000) {
             auto it = client_wait_list_.begin();
             client_wait_list_.erase(it);
@@ -474,23 +538,113 @@ bool RaftNode::Propose(int32_t key, std::string_view val, const std::shared_ptr<
     return true;
 }
 
+bool RaftNode::ProposeRead(const Slice& key, const std::shared_ptr<Connection>& client_conn, uint64_t req_id) {
+    if (is_shutting_down_.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    std::string ctx = std::to_string(node_id_) + "_" + std::to_string(next_read_ctx_id_.fetch_add(1));
 
-bool RaftNode::ProposeRead(int32_t key, const std::shared_ptr<Connection>& client_conn) {
     {
         std::lock_guard<std::mutex> lock(core_mtx_);
-        if (!core_->IsLeader()) {
+        if (!core_->ProposeReadIndex(ctx)) {
             return false;
         }
     }
 
-    std::string val = storage_adapter_.StateMachineGet(key);
-    if (client_conn && client_conn->IsConnected()) {
-        std::string reply = raft_node::WireProtocol::Serialize(
-            raft_node::Opcode::GET_RAW,
-            key,
-            val
-        );
-        client_conn->Send(reply);
-    }
+    pending_client_reads_[ctx] = PendingClientRead{
+        ctx, key.ToString(), req_id, client_conn, std::chrono::steady_clock::now()
+    };
+
+    ScheduleCheckAndAdvance();
     return true;
+}
+
+void RaftNode::CleanupExpiredReads() {
+    bool is_leader = false;
+    uint32_t leader_id = 0;
+    {
+        std::lock_guard<std::mutex> lock(core_mtx_);
+        is_leader = core_->IsLeader();
+        leader_id = core_->GetLeaderId();
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    uint16_t leader_port = (leader_id != RaftCore::kNoLeader) ? (8880 + static_cast<uint16_t>(leader_id) + 1000) : 0;
+    std::string reject_payload = "REJECT:" + std::to_string(leader_port);
+
+    if (!is_leader) {
+        for (auto& [ctx, req] : pending_client_reads_) {
+            if (auto conn = req.conn.lock()) {
+                conn->Send(raft_node::WireProtocol::Serialize(raft_node::Opcode::GET_RAW, Slice(req.key), reject_payload, req.client_req_id));
+            }
+        }
+        pending_client_reads_.clear();
+
+        for (auto& req : waiting_applied_reads_) {
+            if (auto conn = req.conn.lock()) {
+                conn->Send(raft_node::WireProtocol::Serialize(raft_node::Opcode::GET_RAW, Slice(req.key), reject_payload, req.client_req_id));
+            }
+        }
+        waiting_applied_reads_.clear();
+        return;
+    }
+
+    for (auto it = pending_client_reads_.begin(); it != pending_client_reads_.end();) {
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second.start_time).count() > 2000) {
+            if (auto conn = it->second.conn.lock()) {
+                conn->Send(raft_node::WireProtocol::Serialize(raft_node::Opcode::GET_RAW, Slice(it->second.key), reject_payload, it->second.client_req_id));
+            }
+            it = pending_client_reads_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void RaftNode::ProcessReadStates(const std::vector<ReadState>& read_states) {
+    uint64_t current_applied = 0;
+    {
+        std::lock_guard<std::mutex> lock(core_mtx_);
+        current_applied = core_->GetLastApplied();
+    }
+
+    for (const auto& rs : read_states) {
+        auto it = pending_client_reads_.find(rs.request_ctx);
+        if (it == pending_client_reads_.end()) continue;
+
+        PendingClientRead req = std::move(it->second);
+        pending_client_reads_.erase(it);
+
+        auto conn = req.conn.lock();
+        if (!conn || !conn->IsConnected()) continue;
+
+        if (current_applied >= rs.read_index) {
+            std::string val = storage_adapter_.StateMachineGet(Slice(req.key));
+            std::string reply = raft_node::WireProtocol::Serialize(
+                raft_node::Opcode::GET_RAW, Slice(req.key), val, req.client_req_id
+            );
+            conn->Send(reply);
+        } else {
+            waiting_applied_reads_.push_back(WaitingApplyRead{rs.read_index, req.key, req.client_req_id, req.conn});
+        }
+    }
+}
+
+void RaftNode::CheckWaitingAppliedReads(uint64_t current_applied) {
+    auto it = waiting_applied_reads_.begin();
+    while (it != waiting_applied_reads_.end()) {
+        if (current_applied >= it->read_index) {
+            auto conn = it->conn.lock();
+            if (conn && conn->IsConnected()) {
+                std::string val = storage_adapter_.StateMachineGet(Slice(it->key));
+                std::string reply = raft_node::WireProtocol::Serialize(
+                    raft_node::Opcode::GET_RAW, Slice(it->key), val, it->client_req_id
+                );
+                conn->Send(reply);
+            }
+            it = waiting_applied_reads_.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }

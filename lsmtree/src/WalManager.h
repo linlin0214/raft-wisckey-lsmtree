@@ -83,9 +83,7 @@ public:
     void recovery(skiplist& list) {
         if (disable_) return;
         std::lock_guard<std::mutex> lock(mtx_);
-        if (dest_) {
-            std::fflush(dest_); 
-        }
+        if (dest_) std::fflush(dest_); 
 
         FILE* src = std::fopen(log_path_.c_str(), "rb");
         if (!src) return;
@@ -97,32 +95,26 @@ public:
             std::fseek(src, 0, SEEK_SET);
             std::vector<char> file_data(file_size);
             
-            if (std::fread(file_data.data(), 1, file_size, src) == (size_t)file_size) {
+            if (std::fread(file_data.data(), 1, file_size, src) == static_cast<size_t>(file_size)) {
                 size_t offset = 0;
-                while (offset + 13 <= (size_t)file_size) {
+                while (offset + 7 <= static_cast<size_t>(file_size)) {
                     char type = file_data[offset];
-                    if (type != 1) { 
-                        std::cerr << "[WAL Recovery] 检测到无效的 Record 标记，恢复中断。损坏偏移量: " << offset << std::endl;
-                        break; 
-                    }
+                    if (type != 1) break; 
                     
-                    int key, level;
+                    uint16_t klen;
                     uint32_t vlen;
-                    std::memcpy(&key, file_data.data() + offset + 1, 4);
-                    std::memcpy(&level, file_data.data() + offset + 5, 4);
-                    std::memcpy(&vlen, file_data.data() + offset + 9, 4);
+                    std::memcpy(&klen, file_data.data() + offset + 1, 2);
+                    std::memcpy(&vlen, file_data.data() + offset + 3, 4);
                     
-                    offset += 13;
-                    if (offset + vlen > (size_t)file_size) {
-                        std::cerr << "[WAL Recovery] 发现未完全落盘的尾部残损记录，安全截断。" << std::endl;
-                        break; 
-                    }
+                    offset += 7;
+                    if (offset + klen + vlen > static_cast<size_t>(file_size)) break; 
                     
+                    std::string key(file_data.data() + offset, klen);
+                    offset += klen;
                     std::string value(file_data.data() + offset, vlen);
                     offset += vlen;
 
-                    // 恢复时屏蔽 WAL 中记录的 level，强制调用随机高度生成器重新为节点赋予多层索引结构
-                    list.insert(key, value, list.RandomLevel());
+                    list.insert(Slice(key), value, list.RandomLevel());
                 }
             }
         }
@@ -145,21 +137,20 @@ public:
         if (batch.entries.empty()) return;
 
         std::string batch_buffer;
-        batch_buffer.reserve(batch.entries.size() * 100); 
+        batch_buffer.reserve(batch.entries.size() * 128); 
 
         for (const auto& entry : batch.entries) {
-            char header[13];
-            header[0] = 1;
-            int key = entry.key;
-            int level = 0; 
+            char header[7];
+            header[0] = 1; // Record Type
+            uint16_t klen = static_cast<uint16_t>(entry.key.size());
             uint32_t vlen = static_cast<uint32_t>(entry.value.size());
 
-            std::memcpy(header + 1, &key, 4);
-            std::memcpy(header + 5, &level, 4);
-            std::memcpy(header + 9, &vlen, 4);
+            std::memcpy(header + 1, &klen, 2);
+            std::memcpy(header + 3, &vlen, 4);
 
-            batch_buffer.append(header, 13);
-            batch_buffer.append(entry.value.data(), vlen);
+            batch_buffer.append(header, 7);
+            if (klen > 0) batch_buffer.append(entry.key.data(), klen);
+            if (vlen > 0) batch_buffer.append(entry.value.data(), vlen);
         }
 
         std::lock_guard<std::mutex> lock(mtx_);
@@ -169,17 +160,15 @@ public:
                 buffer_.clear(); 
             }
             std::fwrite(batch_buffer.data(), 1, batch_buffer.size(), dest_);
-            std::fflush(dest_); //  无论何种模式，都必须 fflush 写入内核 Page Cache（微秒级）
+            std::fflush(dest_);
 
-            is_dirty_.store(true, std::memory_order_release); //  标记有脏数据未物理落盘
+            is_dirty_.store(true, std::memory_order_release);
 
-            //  核心纠偏：只有前台开启了强制 sync_mode_ 才会阻塞执行 fdatasync。
-            // 默认情况下，依靠操作系统或后台线程进行异步物理刷盘，彻底解放前台吞吐率！
             if (sync_mode_) {
                 int fd = fileno(dest_);
                 if (fd >= 0) {
                     ::fdatasync(fd); 
-                    is_dirty_.store(false, std::memory_order_release); // 物理已安全固化
+                    is_dirty_.store(false, std::memory_order_release);
                 }
             }
         }

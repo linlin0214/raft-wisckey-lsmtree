@@ -1,5 +1,6 @@
 #include "RaftStorageAdapter.h"
 #include "Config.h"
+#include "Slice.h"
 #include <spdlog/spdlog.h>
 #include <filesystem>
 #include <fstream>
@@ -25,7 +26,6 @@ AdvanceState RaftStorageAdapter::PersistReady(const Ready& rd) {
     uint64_t new_stabled_index = 0;
     uint64_t new_applied_index = last_applied_.load(std::memory_order_relaxed);
 
-    // Step 1: 追加 WAL 并执行物理强刷盘 (fdatasync)
     if (!rd.entries.empty()) {
         uint64_t first_append_index = rd.entries.front().index;
         
@@ -50,7 +50,7 @@ AdvanceState RaftStorageAdapter::PersistReady(const Ready& rd) {
         auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::high_resolution_clock::now() - start_time).count();
 
-        if (total_payload_bytes > 0 &&(batch.size() >= 16 || elapsed_us > 2000)) {
+        if (total_payload_bytes > 0 && (batch.size() >= 16 || elapsed_us > 2000)) {
             spdlog::info("[WAL Diagnostic] WAL Batch 刷盘监控 | batch_size: {} 条 | payload: {} B | sync_cost: {:.2f} ms",
                          batch.size(), total_payload_bytes, elapsed_us / 1000.0);
         }
@@ -63,30 +63,28 @@ AdvanceState RaftStorageAdapter::PersistReady(const Ready& rd) {
         }
     }
 
-    // Step 2: 状态机 Apply 批量升级：收集本批次所有 committed_entries，单次调用 PutBatch 写入 DB
     if (!rd.committed_entries.empty()) {
-        std::vector<std::pair<int, std::string>> apply_batch;
+        std::vector<std::pair<std::string, std::string>> apply_batch;
         apply_batch.reserve(rd.committed_entries.size());
 
         for (const auto& entry : rd.committed_entries) {
             if (entry.data.empty()) {
                 new_applied_index = entry.index;
-                continue; // 过滤 No-op 盲日志
+                continue;
             }
 
             auto parsed = raft_node::WireProtocol::Parse(entry.data);
             if (parsed.has_value()) {
-                auto [header, val_view] = *parsed;
+                auto [header, key_view, val_view, skip] = *parsed;
                 if (header.opcode == raft_node::Opcode::PUT_RAW || header.opcode == raft_node::Opcode::PUT_META) {
-                    apply_batch.push_back({header.key, std::string(val_view)});
+                    apply_batch.push_back({std::string(key_view), std::string(val_view)});
                 } else if (header.opcode == raft_node::Opcode::DEL) {
-                    apply_batch.push_back({header.key, config::TOMBSTONE});
+                    apply_batch.push_back({std::string(key_view), config::TOMBSTONE});
                 }
             }
             new_applied_index = entry.index;
         }
 
-        // 一次性批量 Apply 进入 DB
         if (!apply_batch.empty() && state_machine_) {
             state_machine_->PutBatch(apply_batch);
         }
@@ -95,12 +93,10 @@ AdvanceState RaftStorageAdapter::PersistReady(const Ready& rd) {
         commit_index_.store(std::max(commit_index_.load(), new_applied_index), std::memory_order_release);
     }
 
-    // Step 3: 只有当 Term / VotedFor 发生物理改变时才写元数据文件
     if (rd.hard_state.has_value()) {
         SaveHardState(rd.hard_state->term, rd.hard_state->voted_for, commit_index_.load(), last_applied_.load());
     }
 
-    // 🚀 Step 4: 处理快照持久化与 WAL 日志物理截断
     if (rd.snapshot.is_valid) {
         std::string snap_data_path = base_dir_ + "/snapshot.data";
         if (CreateSnapshot(snap_data_path, rd.snapshot.meta.index)) {
@@ -128,16 +124,16 @@ bool RaftStorageAdapter::ApplyCommit(const std::string& raft_cmd) {
         return true;
     }
 
-    auto [header, val_view] = *parsed;
+    auto [header, key_view, val_view, skip] = *parsed;
 
     switch (header.opcode) {
         case raft_node::Opcode::PUT_RAW:
         case raft_node::Opcode::PUT_META: {
-            state_machine_->Put(header.key, std::string(val_view));
+            state_machine_->Put(Slice(key_view), std::string(val_view));
             return true;
         }
         case raft_node::Opcode::DEL: {
-            state_machine_->Delete(header.key);
+            state_machine_->Delete(Slice(key_view));
             return true;
         }
         default:
@@ -276,7 +272,6 @@ void RaftStorageAdapter::LoadHardState() {
     }
 }
 
-// 🚀 持久化快照元数据文件 snapshot.meta
 bool RaftStorageAdapter::SaveSnapshotMeta(uint64_t index, uint64_t term) {
     std::lock_guard<std::mutex> lock(meta_mtx_);
     std::string tmp_path = snap_meta_path_ + ".tmp";
@@ -298,7 +293,6 @@ bool RaftStorageAdapter::SaveSnapshotMeta(uint64_t index, uint64_t term) {
     return true;
 }
 
-// 🚀 读取快照元数据文件 snapshot.meta
 void RaftStorageAdapter::LoadSnapshotMeta() {
     std::lock_guard<std::mutex> lock(meta_mtx_);
     std::ifstream ifs(snap_meta_path_);
@@ -311,7 +305,6 @@ void RaftStorageAdapter::LoadSnapshotMeta() {
     }
 }
 
-// 🚀 提供给 RaftNode 初始化的冷启动快照接口
 Snapshot RaftStorageAdapter::GetSnapshot() const {
     Snapshot snap;
     snap.meta.index = snap_last_index_.load(std::memory_order_acquire);
@@ -320,7 +313,7 @@ Snapshot RaftStorageAdapter::GetSnapshot() const {
     return snap;
 }
 
-std::string RaftStorageAdapter::StateMachineGet(int key) {
+std::string RaftStorageAdapter::StateMachineGet(const Slice& key) {
     std::lock_guard<std::mutex> lock(storage_mtx_);
     return state_machine_ ? state_machine_->Get(key) : "NOT_FOUND";
 }
@@ -332,15 +325,28 @@ bool RaftStorageAdapter::CreateSnapshot(const std::string& snapshot_file_path, u
     std::ofstream ofs(tmp_path, std::ios::binary | std::ios::trunc);
     if (!ofs.is_open()) return false;
 
-    auto all_kvs = state_machine_->GetAllKVs(); 
-    for (const auto& kv : all_kvs) {
-        int key = kv.first;
-        uint32_t len = static_cast<uint32_t>(kv.second.size());
-        ofs.write(reinterpret_cast<const char*>(&key), sizeof(key));
-        ofs.write(reinterpret_cast<const char*>(&len), sizeof(len));
-        if (len > 0) {
-            ofs.write(kv.second.data(), len);
+    auto merge_iter = state_machine_->NewMergingIterator();
+
+    while (merge_iter->Valid()) {
+        Slice key = merge_iter->Key();
+        std::string raw_ptr_or_val = merge_iter->Value();
+
+        std::string actual_val;
+        if (raw_ptr_or_val.size() == sizeof(VLogPointer)) {
+            VLogPointer ptr = VLogPointer::Decode(raw_ptr_or_val);
+            actual_val = (ptr.size > 0) ? state_machine_->ReadVLog(ptr) : "";
+        } else {
+            actual_val = raw_ptr_or_val;
         }
+
+        uint16_t klen = static_cast<uint16_t>(key.size());
+        uint32_t vlen = static_cast<uint32_t>(actual_val.size());
+        ofs.write(reinterpret_cast<const char*>(&klen), sizeof(klen));
+        ofs.write(reinterpret_cast<const char*>(&vlen), sizeof(vlen));
+        if (klen > 0) ofs.write(key.data(), klen);
+        if (vlen > 0) ofs.write(actual_val.data(), vlen);
+
+        merge_iter->Next();
     }
 
     ofs.flush();
@@ -349,7 +355,6 @@ bool RaftStorageAdapter::CreateSnapshot(const std::string& snapshot_file_path, u
         ::fsync(fd); 
         ::close(fd); 
     }
-    
     ::rename(tmp_path.c_str(), snapshot_file_path.c_str());
     return true; 
 }
@@ -365,20 +370,20 @@ void RaftStorageAdapter::ApplySnapshot(const std::string& snapshot_file_path, ui
     DB::DestroyDB(tmp_dir); 
     
     Options opts;
-    opts.disable_wal = true;//快照恢复时的临时 DB 同样关闭 WAL
+    opts.disable_wal = true;
 
     auto tmp_db = std::make_unique<DB>(tmp_dir);
     std::ifstream ifs(snapshot_file_path, std::ios::binary);
-    int key; 
-    uint32_t len;
+    uint16_t klen;
+    uint32_t vlen;
     
-    while (ifs.read(reinterpret_cast<char*>(&key), sizeof(key))) {
-        ifs.read(reinterpret_cast<char*>(&len), sizeof(len));
-        std::string val(len, '\0');
-        if (len > 0) {
-            ifs.read(&val[0], len);
-        }
-        tmp_db->Put(key, val);
+    while (ifs.read(reinterpret_cast<char*>(&klen), sizeof(klen))) {
+        ifs.read(reinterpret_cast<char*>(&vlen), sizeof(vlen));
+        std::string key(klen, '\0');
+        if (klen > 0) ifs.read(&key[0], klen);
+        std::string val(vlen, '\0');
+        if (vlen > 0) ifs.read(&val[0], vlen);
+        tmp_db->Put(Slice(key), val);
     }
     
     tmp_db.reset();
@@ -398,10 +403,7 @@ void RaftStorageAdapter::ApplySnapshot(const std::string& snapshot_file_path, ui
     }
 
     std::filesystem::remove_all(backup_dir, ec);
-
-    state_machine_ = std::make_unique<DB>(target_dir, opts);//重建后的 DB 保持 disable_wal = true
-    
+    state_machine_ = std::make_unique<DB>(target_dir, opts);
     log_engine_.TruncatePrefix(last_included_index);
-
     SaveHardState(current_term_.load(), voted_for_.load(), last_included_index, last_included_index);
 }

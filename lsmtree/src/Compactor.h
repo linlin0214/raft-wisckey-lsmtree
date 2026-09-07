@@ -11,13 +11,14 @@
 #include "SSTableReader.h"
 #include "SSTableBuilder.h"
 #include "Config.h"
+#include "Slice.h"
 
 struct MergeNode {
-    int key;
+    std::string key;
     int idx; 
 
     bool operator>(const MergeNode& other) const {
-        if (key != other.key) return key > other.key;
+        if (key != other.key) return Slice(key) > Slice(other.key);
         return idx > other.idx; 
     }
 };
@@ -41,23 +42,19 @@ public:
                 total_estimated_keys += inputs[i]->GetBlockCount();
                 auto it = std::make_unique<SSTableIterator>(inputs[i].get());
                 if (it->Valid()) {
-                    pq.push({it->Key(), static_cast<int>(i)}); 
+                    pq.push({it->Key().ToString(), static_cast<int>(i)}); 
                 }
                 iters.push_back(std::move(it));
             }
         }
 
         std::unique_ptr<SSTableBuilder> builder;
-        int last_key = 0; 
+        std::string last_key; 
         bool has_last_key = false;
 
         const size_t size_threshold = (target_level <= 1) ? (16 << 20) : (64 << 20);
-        
         size_t inputs_denom = std::max<size_t>(1, inputs.size() / 2);
         const size_t estimated_bloom_capacity = std::max<size_t>(20000, total_estimated_keys / inputs_denom);
-
-        uint64_t processed_keys = 0;
-        uint64_t written_keys = 0;
 
         auto finalize_builder = [&](std::unique_ptr<SSTableBuilder>& b) {
             if (b) {
@@ -71,9 +68,8 @@ public:
             pq.pop();
 
             auto& it = iters[cur.idx];
-            processed_keys++;
 
-            if (has_last_key && cur.key == last_key) {
+            if (has_last_key && Slice(cur.key) == Slice(last_key)) {
                 // 重复 key 跳过
             } else {
                 last_key = cur.key;
@@ -96,20 +92,18 @@ public:
                         new_files.push_back(current_outname);
                     }
                     
-                    builder->Add(cur.key, std::move(value)); 
-                    written_keys++;
+                    builder->Add(Slice(cur.key), std::move(value)); 
                 }
             }
 
             it->Next();
             if (it->Valid()) {
-                pq.push({it->Key(), cur.idx}); 
+                pq.push({it->Key().ToString(), cur.idx}); 
             }
         }
 
         finalize_builder(builder);
 
-        // Compaction 扫描结束后，强制内核驱逐所有输入 SST 的缓存
         iters.clear();
         for (const auto& input : inputs) {
             if (input) {
@@ -121,7 +115,6 @@ public:
             }
         }
 
-        // 强制内核驱逐刚写出的新 SST 文件的缓存
         for (const auto& fname : new_files) {
             int fd = ::open(fname.c_str(), O_RDONLY);
             if (fd >= 0) {

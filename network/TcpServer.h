@@ -14,6 +14,7 @@ class TcpServer {
 public:
     using ConnectionCallback = std::function<void(const std::shared_ptr<Connection>&)>;
     using MessageCallback = std::function<void(const std::shared_ptr<Connection>&, Buffer*)>;
+    
 
 private:
     EventLoop* loop_;                                                   
@@ -24,7 +25,8 @@ private:
     ConnectionCallback connection_callback_;
     MessageCallback message_callback_;
 
-    std::atomic<bool> started_{false};                                 
+    std::atomic<bool> started_{false};
+    int idle_timeout_sec_{0};                                 
 
     void NewConnection(int sockfd);
     void RemoveConnection(const std::shared_ptr<Connection>& conn);
@@ -45,4 +47,7 @@ public:
 
     void Start();
     void Stop();
+
+    // 设置连接空闲超时淘汰时限 (单位: 秒，默认 0 表示不开启)
+    void SetIdleTimeout(int timeout_seconds) { idle_timeout_sec_ = timeout_seconds; }
 };

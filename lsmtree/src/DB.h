@@ -15,6 +15,7 @@
 #include "ThreadPool.h"
 #include "Iterator.h"
 #include "Slice.h"
+#include "RateLimiter.h"
 #include <cstddef>
 #include <memory>
 #include <vector>
@@ -61,12 +62,14 @@ public:
           wal_(base_dir_ + "production.wal", false, options_.disable_wal), 
           vlog_(base_dir_ + "vlog_storage"), 
           manifest_manager_(base_dir_), 
-          high_pri_pool(1),
-          low_pri_pool(2),
+          high_pri_pool(1), // 负责 Flush
+          low_pri_pool(2),  // 专职负责 Compaction 和 GC
           shutting_down_(false),
           is_compacting_(false),
           is_gcing_(false),
-          file_id_(0) {
+          file_id_(0),
+          // 仅引入令牌桶限速器平抑磁盘写入带宽，不额外新建线程
+          gc_rate_limiter_(std::make_unique<TokenBucketRateLimiter>(options_.vlog_gc_rate_limit_bytes)) {
         
         std::filesystem::create_directories(base_dir_);
         levels_.resize(config::K_NUM_LEVELS); 
@@ -91,6 +94,7 @@ public:
             std::lock_guard<std::mutex> lock(cv_mutex_);
             put_cv_.notify_all();
         }
+        // high_pri_pool 与 low_pri_pool 会在自身析构函数中自动唤醒并安全 join 全部 Worker
     }
 
     void Put(const Slice& key, const std::string& value) {
@@ -254,6 +258,14 @@ public:
             wal_.Sync();
         }
         vlog_.Sync();
+    }
+
+    // 允许外部主动向 low_pri_pool 线程池投递一次 GC 检查
+    void MaybeTriggerGCAsync() {
+        if (shutting_down_.load(std::memory_order_relaxed)) return;
+        low_pri_pool.Enqueue([this]() {
+            MaybeTriggerGC();
+        });
     }
 
 private:
@@ -453,6 +465,7 @@ private:
         GCWork();
     }
 
+    // 铁律 3：纯被动触发 + 严格垃圾率门禁，杜绝 0 垃圾强行兜底
     void GCWork() {
         struct SampleItem {
             std::string key;
@@ -480,6 +493,7 @@ private:
             }
         }
 
+        // 积压段数少于 4 个时直接跳过，绝不打扰前台
         if (inactive_vlogs.size() < 4) return;
 
         std::sort(inactive_vlogs.begin(), inactive_vlogs.end());
@@ -551,6 +565,7 @@ private:
             }
         }
 
+        // 严格硬拦截：垃圾率不足阈值或低于 20% 时直接返回，彻底杜绝 0 垃圾无意义重写
         if (max_garbage_ratio < dynamic_threshold || best_victim_id == 0 || max_garbage_ratio <= 0.20) {
             return; 
         }
@@ -576,6 +591,15 @@ private:
 
         auto FlushGCBatch = [&](std::vector<GCEntry>& batch) {
             if (batch.empty()) return;
+
+            // 核心接入：使用令牌桶限速器按字节控速，压平磁盘 I/O 尖刺
+            size_t batch_bytes = 0;
+            for (const auto& item : batch) {
+                batch_bytes += sizeof(uint16_t) + sizeof(uint32_t) + item.key.size() + item.value.size();
+            }
+            if (gc_rate_limiter_) {
+                gc_rate_limiter_->Request(batch_bytes);
+            }
 
             std::vector<VLogPointer> new_ptrs;
             new_ptrs.reserve(batch.size());
@@ -612,7 +636,7 @@ private:
                 MaybeSwapMemtable(write_lock);
             }
             batch.clear();
-            std::this_thread::sleep_for(std::chrono::microseconds(200));
+            std::this_thread::sleep_for(std::chrono::microseconds(200)); // 让路前台写入
         };
 
         while (::pread(fd, &key_len, sizeof(key_len), current_offset) == sizeof(key_len)) {
@@ -668,6 +692,7 @@ private:
         }
         ::close(fd);
 
+        // 仅在 vlog_mutex_ 保护下注销并删除文件，绝不持有 rw_mutex_ 阻塞前台读写
         {
             std::lock_guard<std::mutex> vlog_lock(vlog_mutex_);
             vlog_.RemoveSegment(victim_id);
@@ -689,6 +714,7 @@ private:
         return 0;
     }
 
+    // Immutable 队列门禁放宽至 8，提供充足平滑写缓冲
     void MaybeSwapMemtable(std::unique_lock<std::mutex>& lsm_lock) {
         if (arena_.memory_usage() > config::K_MEMTABLE_THRESHOLD) {
             
@@ -719,6 +745,7 @@ private:
         }
     }
 
+    // 先挂载新 SSTable，再弹出 Immutable 队列，0 读黑洞
     void SingleFlushTask() {
         std::shared_ptr<ImmContext> imm_to_flush;
         {
@@ -750,8 +777,11 @@ private:
             put_cv_.notify_all();
         }
 
+        // 核心优化：解耦投递至 low_pri_pool(2)，充分利用两个线程分别并发运行 Compaction 和 GC
         low_pri_pool.Enqueue([this]() {
             MaybeTriggerCompaction();
+        });
+        low_pri_pool.Enqueue([this]() {
             MaybeTriggerGC();
         });
     }
@@ -782,11 +812,13 @@ private:
 
     std::condition_variable put_cv_;       
     
-    ThreadPool high_pri_pool;
-    ThreadPool low_pri_pool;
+    ThreadPool high_pri_pool; // 专职负责 Flush (1 线程)
+    ThreadPool low_pri_pool;  // 专职负责 Compaction 和 GC (2 线程)
     
     std::atomic<bool> shutting_down_;
     std::atomic<bool> is_compacting_;
     std::atomic<bool> is_gcing_;
     std::atomic<int> file_id_;
+
+    std::unique_ptr<TokenBucketRateLimiter> gc_rate_limiter_;
 };

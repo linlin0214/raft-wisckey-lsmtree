@@ -23,6 +23,9 @@ public:
 
     bool Started() const { return started_; }
 
+    //供 TcpServer 遍历所有子 Reactor 并发挂载 TimingWheel
+    const std::vector<EventLoop*>& GetAllLoops() const { return loops_; }
+
 private:
     EventLoop* base_loop_; // 主 Reactor 实例
     bool started_{false};

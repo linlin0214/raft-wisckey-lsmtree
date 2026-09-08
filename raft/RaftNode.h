@@ -2,7 +2,7 @@
 
 #include "lsmtree/src/RaftStorageAdapter.h"
 #include "lsmtree/src/Slice.h"
-#include "lsmtree/src/SPSCQueue.h" // 🚀 引入 SPSC 无锁队列
+#include "lsmtree/src/SPSCQueue.h"
 #include "RaftCore.h"
 #include "protocol/RaftRpc.h"
 #include "network/EventLoop.h"
@@ -18,6 +18,7 @@
 #include <mutex>
 #include <atomic>
 #include <thread>
+#include <chrono>
 
 namespace raft_rpc {
 class RaftDispatcher;
@@ -69,7 +70,8 @@ public:
         EventLoop* loop,
         uint32_t node_id,
         const std::vector<uint32_t>& peer_ids,
-        raft_rpc::RaftDispatcher* dispatcher
+        raft_rpc::RaftDispatcher* dispatcher,
+        const std::string& storage_dir = ""
     );
 
     ~RaftNode();
@@ -199,7 +201,6 @@ private:
 
     RaftStorageAdapter storage_adapter_;
 
-    // 🚀 核心改造：彻底替换为 SPSC 环形无锁持久化队列
     std::thread storage_thread_;
     SPSCQueue<Ready, 65536> storage_queue_;
     std::atomic<bool> storage_running_{false};
@@ -214,7 +215,13 @@ private:
     TimerQueue tick_timer_;
 
     std::mutex client_mtx_;
-    std::unordered_map<uint64_t, std::shared_ptr<Connection>> client_wait_list_;
+    
+    // 带有时间戳的客户端写等待实体，用于计算端到端 P99 延迟
+    struct PendingClientWrite {
+        std::shared_ptr<Connection> conn;
+        std::chrono::steady_clock::time_point start_time;
+    };
+    std::unordered_map<uint64_t, PendingClientWrite> client_wait_list_;
     std::unordered_map<uint64_t, std::weak_ptr<Connection>> pending_replies_;
 
     std::atomic<bool> is_shutting_down_{false};

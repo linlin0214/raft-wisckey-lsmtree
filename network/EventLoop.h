@@ -6,6 +6,9 @@
 #include <thread>
 #include <mutex>
 #include <atomic>
+#include <string>
+#include <unordered_map>
+
 
 class Epoll;
 class Channel;
@@ -34,6 +37,20 @@ public:
     void AssertInLoopThread();
     bool IsInLoopThread() const { return thread_id_ == std::this_thread::get_id(); }
 
+    public:
+    void SetContext(const std::string& key, std::shared_ptr<void> ctx) {
+        contexts_[key] = std::move(ctx);
+    }
+
+    template <typename T>
+    std::shared_ptr<T> GetContext(const std::string& key) const {
+        auto it = contexts_.find(key);
+        if (it != contexts_.end()) {
+            return std::static_pointer_cast<T>(it->second);
+        }
+        return nullptr;
+    }
+
 private:
     void Wakeup();
     void HandleRead();
@@ -56,4 +73,6 @@ private:
     std::vector<std::function<void()>> pending_functors_; // 跨线程投递的待处理闭包任务池
 
     ChannelList active_channels_;          // 每次 epoll_wait 捞出的活跃通道数组
+
+    std::unordered_map<std::string, std::shared_ptr<void>> contexts_;
 };

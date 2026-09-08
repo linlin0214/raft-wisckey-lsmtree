@@ -4,6 +4,8 @@
 #include "raft/RaftNode.h"
 #include "protocol/wire_protocol.h"  
 #include "protocol/RaftRpc.h"
+#include "protocol/ServerConfig.h"
+#include "protocol/Metrics.h"
 #include "network/Channel.h"
 #include "lsmtree/third_party/httplib.h"
 #include "lsmtree/src/Slice.h"
@@ -19,13 +21,30 @@
 using namespace raft_rpc;
 
 int main(int argc, char* argv[]) {
-    if (argc < 4) {
-        spdlog::error("Usage: {} [NodeID] [ListenPort] [Peer1_Port|Peer1_ID:Port] ...", argv[0]);
-        return -1;
+    std::string config_path = "conf/node_1.toml";
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if ((arg == "-c" || arg == "--config") && i + 1 < argc) {
+            config_path = argv[++i];
+        }
     }
 
     spdlog::set_level(spdlog::level::info);
 
+    // 1. 忽略 SIGPIPE 防止网络连接异常时进程崩溃
+    ::signal(SIGPIPE, SIG_IGN);
+
+    // 2. 加载 TOML 配置
+    config::ServerConfig cfg;
+    try {
+        cfg = config::ServerConfig::LoadFromFile(config_path);
+        spdlog::info("[System] 成功装载结构化配置 [{}] | 节点 ID: {}", config_path, cfg.node_id);
+    } catch (const std::exception& e) {
+        spdlog::critical("[System] 配置文件读取失败: {}", e.what());
+        return -1;
+    }
+
+    // 3. 屏蔽退出信号，交给 signalfd 统一处理
     sigset_t mask;
     sigemptyset(&mask);
     sigaddset(&mask, SIGINT);
@@ -35,13 +54,9 @@ int main(int argc, char* argv[]) {
         return -1;
     }
 
-    uint32_t my_id = static_cast<uint32_t>(std::stoi(argv[1]));
-    uint16_t my_port = static_cast<uint16_t>(std::stoi(argv[2]));
-    uint16_t client_service_port = my_port + 1000;
-
-    std::string storage_kv_dir = "node_" + std::to_string(my_id) + "_storage/kv_data";
+    std::string storage_kv_dir = cfg.storage_base_dir + "/kv_data";
     std::filesystem::create_directories(storage_kv_dir);
-    spdlog::info("[System] 磁盘存储盒子隔离空间准备就绪: {}", storage_kv_dir);
+    spdlog::info("[System] 磁盘存储空间准备就绪: {}", storage_kv_dir);
 
     EventLoop loop;
     
@@ -51,49 +66,23 @@ int main(int argc, char* argv[]) {
         return -1;
     }
 
-    TcpServer internal_rpc_server(&loop, "127.0.0.1", my_port);
+    TcpServer internal_rpc_server(&loop, cfg.listen_ip, cfg.rpc_port);
     RaftDispatcher dispatcher;
-    TcpServer client_service_server(&loop, "127.0.0.1", client_service_port);
+    TcpServer client_service_server(&loop, cfg.listen_ip, cfg.client_port);
 
-    // 外部业务门面启用 3 个 Sub-Reactor 工作线程并发处理长连接
-    client_service_server.SetThreadNum(3);
+    // 配置 Sub-Reactor 线程数与时间轮超时时限
+    client_service_server.SetThreadNum(cfg.sub_reactor_threads);
+    client_service_server.SetIdleTimeout(cfg.client_idle_timeout_sec);
 
     std::vector<uint32_t> peer_ids;
-    for (int i = 3; i < argc; ++i) {
-        std::string arg = argv[i];
-        uint32_t peer_id = 0;
-        size_t pos = arg.find(':');
-        if (pos != std::string::npos) {
-            peer_id = static_cast<uint32_t>(std::stoi(arg.substr(0, pos)));
-        } else {
-            uint16_t peer_port = static_cast<uint16_t>(std::stoi(arg));
-            peer_id = (peer_port >= 8881 && peer_port <= 8889) ? (peer_port - 8880) : peer_port;
-        }
-
-        if (peer_id != my_id) {
-            peer_ids.push_back(peer_id);
-        }
+    for (const auto& peer : cfg.peers) {
+        peer_ids.push_back(peer.id);
     }
 
-    auto raft_node = std::make_shared<RaftNode>(&loop, my_id, peer_ids, &dispatcher);
+    auto raft_node = std::make_shared<RaftNode>(&loop, cfg.node_id, peer_ids, &dispatcher, cfg.storage_base_dir);
 
-    for (int i = 3; i < argc; ++i) {
-        std::string arg = argv[i];
-        uint32_t peer_id = 0;
-        uint16_t peer_port = 0;
-
-        size_t pos = arg.find(':');
-        if (pos != std::string::npos) {
-            peer_id = static_cast<uint32_t>(std::stoi(arg.substr(0, pos)));
-            peer_port = static_cast<uint16_t>(std::stoi(arg.substr(pos + 1)));
-        } else {
-            peer_port = static_cast<uint16_t>(std::stoi(arg));
-            peer_id = (peer_port >= 8881 && peer_port <= 8889) ? (peer_port - 8880) : peer_port;
-        }
-
-        if (peer_id != my_id) {
-            raft_node->AddPeer(peer_id, "127.0.0.1", peer_port);
-        }
+    for (const auto& peer : cfg.peers) {
+        raft_node->AddPeer(peer.id, peer.ip, peer.port);
     }
 
     dispatcher.SetPreVoteRequestCallback([raft_node](const std::shared_ptr<Connection>& conn, uint64_t req_id, const PreVoteArgs& args) {
@@ -195,9 +184,12 @@ int main(int argc, char* argv[]) {
     client_service_server.Start();
     raft_node->Start();
 
-    uint16_t http_port = 8080 + my_id;
-    std::thread http_thread([raft_node, my_id, http_port]() {
+    // 嵌入式 Web 控制台与 Prometheus 标准度量端点
+    uint16_t http_port = cfg.http_port;
+    std::thread http_thread([raft_node, http_port]() {
         httplib::Server svr;
+
+        // 1. 保留 JSON 状态路由
         svr.Get("/api/status", [raft_node](const httplib::Request&, httplib::Response& res) {
             auto status = raft_node->GetStatus();
             std::stringstream ss;
@@ -214,11 +206,20 @@ int main(int argc, char* argv[]) {
             res.set_header("Access-Control-Allow-Origin", "*");
             res.set_content(ss.str(), "application/json");
         });
+
+        // 2. 导出 Prometheus / OpenMetrics 文本格式度量数据
+        svr.Get("/metrics", [raft_node](const httplib::Request&, httplib::Response& res) {
+            auto status = raft_node->GetStatus();
+            std::string prom_data = Metrics::Instance().RenderPrometheus(status);
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_content(prom_data, "text/plain; version=0.0.4; charset=utf-8");
+        });
+
         svr.listen("0.0.0.0", http_port);
     });
     http_thread.detach();
 
-    spdlog::info("[System] 内部对账门面 [{}] 与 外部业务门面 [{}] 并网成功！", my_port, client_service_port);
+    spdlog::info("[System] 内部对账门面 [{}] 与 外部业务门面 [{}] 并网成功！", cfg.rpc_port, cfg.client_port);
     loop.Loop();
 
     ::close(sig_fd);

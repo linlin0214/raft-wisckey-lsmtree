@@ -21,6 +21,9 @@ struct Options {
     size_t sst_file_size = config::TARGET_FILE_SIZE; 
     size_t vlog_segment_size = config::MAX_VLOG_SEGMENT_SIZE; 
     bool disable_wal = false; //支持分布式下彻底关闭单机 LSM-Tree 的 WAL
+
+    size_t vlog_gc_rate_limit_bytes = 20 * 1024 * 1024; // 默认平抑为 20 MB/s
+    int gc_interval_sec = 10;                           // 默认每 10 秒唤醒巡检一次
 };
 
 // 物理路径生成器：使用 std::filesystem 完全规避跨平台斜杠问题

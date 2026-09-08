@@ -1,0 +1,30 @@
+[node]
+id = 1
+storage_dir = "node_1_storage"
+
+[network]
+listen_ip = "127.0.0.1"
+rpc_port = 8881
+client_port = 9881
+http_port = 8081
+sub_reactor_threads = 3
+client_idle_timeout_sec = 60
+
+[storage]
+gc_rate_limit_mb = 20
+gc_interval_sec = 10
+disable_wal = true
+
+[raft]
+snapshot_count_threshold = 500000
+snapshot_interval_sec = 300
+
+[[peers]]
+id = 2
+ip = "127.0.0.1"
+port = 8882
+
+[[peers]]
+id = 3
+ip = "127.0.0.1"
+port = 8883

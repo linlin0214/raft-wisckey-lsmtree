@@ -1,6 +1,7 @@
 #include "Connection.h"
 #include "Channel.h"
 #include "EventLoop.h" 
+#include "TimingWheel.h"
 #include <spdlog/spdlog.h>
 #include <unistd.h>
 #include <sys/socket.h>
@@ -54,13 +55,29 @@ void Connection::ConnectionDestroyed() {
     channel_->Remove();
 }
 
+void Connection::ForceClose() {
+    if (state_.load(std::memory_order_acquire) == State::kConnected) {
+        if (loop_->IsInLoopThread()) {
+            // 🚀 主动向对端发送 FIN，关闭套接字读写，立即解除远端客户端阻塞
+            if (fd_ >= 0) {
+                ::shutdown(fd_, SHUT_RDWR);
+            }
+            HandleClose();
+        } else {
+            auto self = shared_from_this();
+            loop_->QueueInLoop([self]() {
+                self->ForceClose();
+            });
+        }
+    }
+}
+
 void Connection::Send(std::string_view data) {
     if (state_.load(std::memory_order_acquire) != State::kConnected) return;
 
     if (loop_->IsInLoopThread()) {
-        SendInLoop(data);// 如果当前就在 EventLoop 线程，直接发
+        SendInLoop(data);
     } else {
-         // 如果当前是其他线程（比如 Raft 业务线程），把发送任务打包成 Lambda，投递到 EventLoop 队列
         auto self = shared_from_this();
         std::string message(data);
         loop_->QueueInLoop([self, message = std::move(message)]() {
@@ -76,7 +93,7 @@ void Connection::SendInLoop(std::string_view data) {
     ssize_t nwrote = 0;
     size_t remaining = data.size();
     bool fault_error = false;
-    //前提：当前没有正在进行的异步写，且输出缓冲区是空的
+
     if (!channel_->IsWriting() && output_buffer_.ReadableBytes() == 0) {
         nwrote = ::write(fd_, data.data(), data.size());
         if (nwrote >= 0) {
@@ -94,7 +111,7 @@ void Connection::SendInLoop(std::string_view data) {
             }
         }
     }
-    //把没发完的数据，追加到用户态的输出缓冲区里暂存
+
     if (!fault_error && remaining > 0 && state_.load(std::memory_order_acquire) == State::kConnected) {
         output_buffer_.Append(data.data() + nwrote, remaining);
         if (!channel_->IsWriting()) {
@@ -110,6 +127,11 @@ void Connection::HandleRead() {
     char buf[65536];
     ssize_t n = ::read(fd_, buf, sizeof(buf));
     if (n > 0) {
+        // 🚀 严谨调整：仅在真正接收到有效网络载荷时才延展租约
+        auto wheel = loop_->GetContext<TimingWheel>("timing_wheel");
+        if (wheel) {
+            wheel->Touch(shared_from_this());
+        }
         input_buffer_.Append(buf, n);
     } else if (n == 0) {
         HandleClose();
@@ -159,14 +181,12 @@ void Connection::HandleClose() {
     if (expected != State::kDisconnected) {
         state_.store(State::kDisconnected, std::memory_order_release);
         
-        // 从 Epoll 拔除，切断事件流
         channel_->DisableAll();
         channel_->Remove();
 
         ConnectionPtr guard(shared_from_this());
         if (close_callback_) {
             auto cb = close_callback_;
-            // 将 close_callback_ 投递至 EventLoop 队列异步延迟执行，保证 Channel::HandleEventWithGuard 完全退出
             loop_->QueueInLoop([guard, cb]() {
                 if (cb) {
                     cb(guard);

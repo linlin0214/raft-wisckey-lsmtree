@@ -48,6 +48,15 @@ public:
     void Send(std::string_view data);
     Buffer* GetInputBuffer() { return &input_buffer_; }
     Buffer* GetOutputBuffer() { return &output_buffer_; }
+    
+    void ForceClose(); //  供时间轮超时触发强制关闭
+
+    // 上下文存取 (弱引用保存，杜绝循环引用导致对象无法释放)
+    void SetCustomContext(const std::shared_ptr<void>& ctx) { custom_context_ = ctx; }
+    template <typename T>
+    std::shared_ptr<T> GetCustomContext() const {
+        return std::static_pointer_cast<T>(custom_context_.lock());
+    }
 
 private:
     void SendInLoop(std::string_view data);
@@ -68,4 +77,6 @@ private:
     ConnectionCallback connection_callback_; // 连接建立/断开上层通知闭包
     MessageCallback message_callback_;       // 接收到新消息上层切包闭包
     CloseCallback close_callback_;           // 内部注销回调 (指向 TcpServer::RemoveConnection)
+
+    std::weak_ptr<void> custom_context_;
 };

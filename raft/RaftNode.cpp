@@ -292,7 +292,6 @@ void RaftNode::OnPersistFinished(Ready rd, AdvanceState state) {
         }
 
         if (found) {
-            // 只要分布式事务成功落盘推进，精准统计端到端物理延迟与计数
             auto now = std::chrono::steady_clock::now();
             uint64_t lat_us = std::chrono::duration_cast<std::chrono::microseconds>(now - pending_write.start_time).count();
             Metrics::Instance().ObserveCommitLatency(lat_us);
@@ -302,8 +301,9 @@ void RaftNode::OnPersistFinished(Ready rd, AdvanceState state) {
                 auto parsed = raft_node::WireProtocol::Parse(entry.data);
                 if (parsed.has_value()) {
                     auto [header, key_view, val_view, skip] = *parsed;
+                    // 动态提取原 header.opcode 序列化回包，支持 WRITE_BATCH 准确应答
                     std::string reply = raft_node::WireProtocol::Serialize(
-                        raft_node::Opcode::PUT_RAW, Slice(key_view), "OK_COMMIT", header.req_id
+                        static_cast<raft_node::Opcode>(header.opcode), Slice(key_view), "OK_COMMIT", header.req_id
                     );
                     pending_write.conn->Send(reply);
                 }
@@ -536,6 +536,49 @@ bool RaftNode::Propose(const Slice& key, std::string_view val, const std::shared
     return true;
 }
 
+bool RaftNode::ProposeBatch(std::string_view full_packet, const std::shared_ptr<Connection>& client_conn, uint64_t req_id) {
+    if (is_shutting_down_.load(std::memory_order_relaxed)) {
+        Metrics::Instance().IncRejectedOps();
+        return false;
+    }
+
+    uint64_t assigned_index = 0;
+    {
+        std::lock_guard<std::mutex> lock(core_mtx_);
+
+        if (!core_->IsLeader()) {
+            Metrics::Instance().IncRejectedOps();
+            return false;
+        }
+
+        uint64_t uncommitted_count = core_->GetLastLogIndex() - core_->GetCommitIndex();
+        if (uncommitted_count > 10000) {
+            Metrics::Instance().IncRejectedOps();
+            return false;
+        }
+
+        // 整个批处理包作为一个独立的原子 Raft 日志记录
+        if (!core_->Propose(std::string(full_packet))) {
+            Metrics::Instance().IncRejectedOps();
+            return false;
+        }
+
+        assigned_index = core_->GetLastLogIndex();
+    }
+
+    {
+        std::lock_guard<std::mutex> cl(client_mtx_);
+        if (client_wait_list_.size() > 20000) {
+            auto it = client_wait_list_.begin();
+            client_wait_list_.erase(it);
+        }
+        client_wait_list_[assigned_index] = PendingClientWrite{client_conn, std::chrono::steady_clock::now()};
+    }
+
+    ScheduleCheckAndAdvance();
+    return true;
+}
+
 bool RaftNode::ProposeRead(const Slice& key, const std::shared_ptr<Connection>& client_conn, uint64_t req_id) {
     if (is_shutting_down_.load(std::memory_order_relaxed)) {
         Metrics::Instance().IncRejectedOps();
@@ -600,7 +643,6 @@ void RaftNode::CleanupExpiredReads() {
             }
             waiting_applied_reads_.clear();
 
-            // 修正类型匹配：item 为 PendingClientWrite 结构体，提取 item.conn 规避编译错误
             for (auto& [idx, item] : client_wait_list_) {
                 if (item.conn && item.conn->IsConnected()) {
                     reject_writes.push_back(item.conn);

@@ -92,6 +92,13 @@ public:
         uint64_t req_id = 0
     );
 
+    // 批处理事务提案通道
+    bool ProposeBatch(
+        std::string_view full_packet,
+        const std::shared_ptr<Connection>& client,
+        uint64_t req_id = 0
+    );
+
     bool ProposeRead(
         const Slice& key,
         const std::shared_ptr<Connection>& client,
@@ -216,7 +223,6 @@ private:
 
     std::mutex client_mtx_;
     
-    // 带有时间戳的客户端写等待实体，用于计算端到端 P99 延迟
     struct PendingClientWrite {
         std::shared_ptr<Connection> conn;
         std::chrono::steady_clock::time_point start_time;

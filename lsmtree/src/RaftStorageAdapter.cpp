@@ -76,10 +76,21 @@ AdvanceState RaftStorageAdapter::PersistReady(const Ready& rd) {
             auto parsed = raft_node::WireProtocol::Parse(entry.data);
             if (parsed.has_value()) {
                 auto [header, key_view, val_view, skip] = *parsed;
-                if (header.opcode == raft_node::Opcode::PUT_RAW || header.opcode == raft_node::Opcode::PUT_META) {
+                raft_node::Opcode op = header.opcode;
+
+                if (op == raft_node::Opcode::PUT_RAW || op == raft_node::Opcode::PUT_META) {
                     apply_batch.push_back({std::string(key_view), std::string(val_view)});
-                } else if (header.opcode == raft_node::Opcode::DEL) {
+                } else if (op == raft_node::Opcode::DEL) {
                     apply_batch.push_back({std::string(key_view), config::TOMBSTONE});
+                } else if (op == raft_node::Opcode::WRITE_BATCH) {
+                    auto items = raft_node::WireProtocol::ParseBatch(val_view);
+                    for (auto& item : items) {
+                        if (item.opcode == raft_node::Opcode::DEL) {
+                            apply_batch.push_back({std::move(item.key), config::TOMBSTONE});
+                        } else {
+                            apply_batch.push_back({std::move(item.key), std::move(item.value)});
+                        }
+                    }
                 }
             }
             new_applied_index = entry.index;
@@ -134,6 +145,22 @@ bool RaftStorageAdapter::ApplyCommit(const std::string& raft_cmd) {
         }
         case raft_node::Opcode::DEL: {
             state_machine_->Delete(Slice(key_view));
+            return true;
+        }
+        case raft_node::Opcode::WRITE_BATCH: {
+            auto items = raft_node::WireProtocol::ParseBatch(val_view);
+            std::vector<std::pair<std::string, std::string>> kvs;
+            kvs.reserve(items.size());
+            for (auto& item : items) {
+                if (item.opcode == raft_node::Opcode::DEL) {
+                    kvs.push_back({std::move(item.key), config::TOMBSTONE});
+                } else {
+                    kvs.push_back({std::move(item.key), std::move(item.value)});
+                }
+            }
+            if (!kvs.empty()) {
+                state_machine_->PutBatch(kvs);
+            }
             return true;
         }
         default:

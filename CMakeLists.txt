@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.15)
 
-# 1. 设置 C++17 编译标准
+# 1. 设置 C++17 编译标准与优化选项
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -35,9 +35,10 @@ file(GLOB RAFT_SOURCES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/raft/*.cc"
 )
 
-# 4. 定义全局公共头文件路径 (供所有二进制目标复用)
+# 4. 定义全局公共头文件路径 (包含 include 目录，供 SDK 引用)
 set(COMMON_INCLUDE_DIRS
     "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include"
     "${CMAKE_CURRENT_SOURCE_DIR}/protocol"
     "${CMAKE_CURRENT_SOURCE_DIR}/raft"
     "${CMAKE_CURRENT_SOURCE_DIR}/network"
@@ -56,6 +57,22 @@ add_executable(raft_node
 target_include_directories(raft_node PRIVATE ${COMMON_INCLUDE_DIRS})
 target_link_libraries(raft_node PRIVATE spdlog::spdlog Threads::Threads)
 
+# 6. 编译目标 2：秒杀业务落地验证程序 (seckill_demo)
+# 支持从 example/seckill_demo.cpp 或根目录 seckill_demo.cpp 编译
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/example/seckill_demo.cpp")
+    set(SECKILL_SRC "${CMAKE_CURRENT_SOURCE_DIR}/example/seckill_demo.cpp")
+elseif (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/seckill_demo.cpp")
+    set(SECKILL_SRC "${CMAKE_CURRENT_SOURCE_DIR}/seckill_demo.cpp")
+endif()
+
+if (DEFINED SECKILL_SRC)
+    add_executable(seckill_demo 
+        ${SECKILL_SRC}
+        ${PROTOCOL_SOURCES}
+    )
+    target_include_directories(seckill_demo PRIVATE ${COMMON_INCLUDE_DIRS})
+    target_link_libraries(seckill_demo PRIVATE Threads::Threads spdlog::spdlog)
+endif()
 
 # 7. 编译目标 3：客户端 CLI (raft_client_cli)
 add_executable(raft_client_cli 

@@ -129,30 +129,50 @@ int main(int argc, char* argv[]) {
             }
 
             auto [header, key_view, value_view, skip] = *parsed_cmd;
-            buf->Retrieve(skip + raft_node::WireProtocol::kHeaderSize + header.body_len);
+            size_t total_packet_len = skip + raft_node::WireProtocol::kHeaderSize + header.body_len;
+            std::string_view full_packet(raw_stream.data() + skip, raft_node::WireProtocol::kHeaderSize + header.body_len);
 
-            if (header.opcode == raft_node::Opcode::PUT_RAW) {
-                bool accepted = raft_node->Propose(Slice(key_view), value_view, conn, header.req_id);
+            // 使用强类型 Opcode 保持类型安全
+            raft_node::Opcode opcode = header.opcode;
+            uint64_t req_id = header.req_id;
+
+            buf->Retrieve(total_packet_len);
+
+            if (opcode == raft_node::Opcode::PUT_RAW) {
+                bool accepted = raft_node->Propose(Slice(key_view), value_view, conn, req_id);
                 if (!accepted) {
                     uint32_t leader_id = raft_node->GetLeaderId();
                     uint16_t leader_port = (leader_id != RaftCore::kNoLeader) ? (8880 + static_cast<uint16_t>(leader_id) + 1000) : 0;
                     
                     std::string reject_payload = "REJECT:" + std::to_string(leader_port);
                     std::string reject_bin = raft_node::WireProtocol::Serialize(
-                        raft_node::Opcode::PUT_RAW, Slice(key_view), reject_payload, header.req_id
+                        raft_node::Opcode::PUT_RAW, Slice(key_view), reject_payload, req_id
                     );
                     conn->Send(reject_bin);
                 }
             } 
-            else if (header.opcode == raft_node::Opcode::GET_RAW) {
-                bool accepted = raft_node->ProposeRead(Slice(key_view), conn, header.req_id);
+            else if (opcode == raft_node::Opcode::WRITE_BATCH) {
+                bool accepted = raft_node->ProposeBatch(full_packet, conn, req_id);
                 if (!accepted) {
                     uint32_t leader_id = raft_node->GetLeaderId();
                     uint16_t leader_port = (leader_id != RaftCore::kNoLeader) ? (8880 + static_cast<uint16_t>(leader_id) + 1000) : 0;
                     
                     std::string reject_payload = "REJECT:" + std::to_string(leader_port);
                     std::string reject_bin = raft_node::WireProtocol::Serialize(
-                        raft_node::Opcode::GET_RAW, Slice(key_view), reject_payload, header.req_id
+                        raft_node::Opcode::WRITE_BATCH, Slice(""), reject_payload, req_id
+                    );
+                    conn->Send(reject_bin);
+                }
+            }
+            else if (opcode == raft_node::Opcode::GET_RAW) {
+                bool accepted = raft_node->ProposeRead(Slice(key_view), conn, req_id);
+                if (!accepted) {
+                    uint32_t leader_id = raft_node->GetLeaderId();
+                    uint16_t leader_port = (leader_id != RaftCore::kNoLeader) ? (8880 + static_cast<uint16_t>(leader_id) + 1000) : 0;
+                    
+                    std::string reject_payload = "REJECT:" + std::to_string(leader_port);
+                    std::string reject_bin = raft_node::WireProtocol::Serialize(
+                        raft_node::Opcode::GET_RAW, Slice(key_view), reject_payload, req_id
                     );
                     conn->Send(reject_bin);
                 }
@@ -184,12 +204,10 @@ int main(int argc, char* argv[]) {
     client_service_server.Start();
     raft_node->Start();
 
-    // 嵌入式 Web 控制台与 Prometheus 标准度量端点
     uint16_t http_port = cfg.http_port;
     std::thread http_thread([raft_node, http_port]() {
         httplib::Server svr;
 
-        // 1. 保留 JSON 状态路由
         svr.Get("/api/status", [raft_node](const httplib::Request&, httplib::Response& res) {
             auto status = raft_node->GetStatus();
             std::stringstream ss;
@@ -207,7 +225,6 @@ int main(int argc, char* argv[]) {
             res.set_content(ss.str(), "application/json");
         });
 
-        // 2. 导出 Prometheus / OpenMetrics 文本格式度量数据
         svr.Get("/metrics", [raft_node](const httplib::Request&, httplib::Response& res) {
             auto status = raft_node->GetStatus();
             std::string prom_data = Metrics::Instance().RenderPrometheus(status);

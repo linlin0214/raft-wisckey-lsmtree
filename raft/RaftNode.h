@@ -2,6 +2,7 @@
 
 #include "lsmtree/src/RaftStorageAdapter.h"
 #include "lsmtree/src/Slice.h"
+#include "lsmtree/src/SPSCQueue.h" // 🚀 引入 SPSC 无锁队列
 #include "RaftCore.h"
 #include "protocol/RaftRpc.h"
 #include "network/EventLoop.h"
@@ -17,8 +18,6 @@
 #include <mutex>
 #include <atomic>
 #include <thread>
-#include <condition_variable>
-#include <queue>
 
 namespace raft_rpc {
 class RaftDispatcher;
@@ -200,10 +199,9 @@ private:
 
     RaftStorageAdapter storage_adapter_;
 
+    // 🚀 核心改造：彻底替换为 SPSC 环形无锁持久化队列
     std::thread storage_thread_;
-    std::mutex storage_queue_mtx_;
-    std::condition_variable storage_cv_;
-    std::queue<Ready> storage_queue_;
+    SPSCQueue<Ready, 65536> storage_queue_;
     std::atomic<bool> storage_running_{false};
 
     std::atomic<bool> is_ready_scheduled_{false};

@@ -9,53 +9,34 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 project(raft_core CXX)
 
 # 2. 查找外部依赖库
-find_package(Threads REQUIRED) # Linux pthread 线程库
+find_package(Threads REQUIRED)
 find_package(spdlog REQUIRED)
-find_package(GTest REQUIRED)   # GoogleTest 单元测试框架
-include(GoogleTest)            # 自动发现测试用例
+find_package(GTest REQUIRED)
+include(GoogleTest)
 
 # 3. 搜集各模块源码文件
-
-# 搜集 LSM-Tree 存储引擎源码
 file(GLOB_RECURSE LSM_CORE_SOURCES 
     "${CMAKE_CURRENT_SOURCE_DIR}/lsmtree/src/*.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/lsmtree/src/*.cc"
 )
 
-# 搜集 protocol 编解码与 Buffer 源码
 file(GLOB PROTOCOL_SOURCES 
     "${CMAKE_CURRENT_SOURCE_DIR}/protocol/*.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/protocol/*.cc"
 )
 
-# 搜集 network 网络引擎源码
-file(GLOB NETWORK_SOURCES 
+file(GLOB NETWORK_SOURCES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/network/*.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/network/*.cc"
 )
 
-# 搜集 raft 共识核心源码 (RaftNode, RaftCore, RaftLog)
 file(GLOB RAFT_SOURCES 
     "${CMAKE_CURRENT_SOURCE_DIR}/raft/*.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/raft/*.cc"
 )
 
-# 4. 编译目标 1：服务端集群节点 (raft_node)
-add_executable(raft_node 
-    main.cpp
-    ${RAFT_SOURCES}
-    ${LSM_CORE_SOURCES}
-    ${PROTOCOL_SOURCES}
-    ${NETWORK_SOURCES}
-)
-
-add_executable(seckill_demo 
-    seckill_demo.cpp
-    ${PROTOCOL_SOURCES}
-)
-target_link_libraries(seckill_demo PRIVATE spdlog::spdlog Threads::Threads)
-
-target_include_directories(raft_node PRIVATE 
+# 4. 定义全局公共头文件路径 (供所有二进制目标复用)
+set(COMMON_INCLUDE_DIRS
     "${CMAKE_CURRENT_SOURCE_DIR}"
     "${CMAKE_CURRENT_SOURCE_DIR}/protocol"
     "${CMAKE_CURRENT_SOURCE_DIR}/raft"
@@ -64,43 +45,35 @@ target_include_directories(raft_node PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/lsmtree/third_party"
 )
 
-target_link_libraries(raft_node PRIVATE 
-    spdlog::spdlog
-    Threads::Threads
+# 5. 编译目标 1：服务端集群节点 (raft_node)
+add_executable(raft_node 
+    main.cpp
+    ${RAFT_SOURCES}
+    ${LSM_CORE_SOURCES}
+    ${PROTOCOL_SOURCES}
+    ${NETWORK_SOURCES}
 )
+target_include_directories(raft_node PRIVATE ${COMMON_INCLUDE_DIRS})
+target_link_libraries(raft_node PRIVATE spdlog::spdlog Threads::Threads)
 
-# 5. 编译目标 2：客户端 CLI (raft_client_cli)
+
+# 7. 编译目标 3：客户端 CLI (raft_client_cli)
 add_executable(raft_client_cli 
     clientmain.cpp
     ${PROTOCOL_SOURCES}
     ${NETWORK_SOURCES}
 )
+target_include_directories(raft_client_cli PRIVATE ${COMMON_INCLUDE_DIRS})
+target_link_libraries(raft_client_cli PRIVATE spdlog::spdlog Threads::Threads)
 
-target_include_directories(raft_client_cli PRIVATE 
-    "${CMAKE_CURRENT_SOURCE_DIR}"
-    "${CMAKE_CURRENT_SOURCE_DIR}/protocol"
-    "${CMAKE_CURRENT_SOURCE_DIR}/network"
-)
-
-target_link_libraries(raft_client_cli PRIVATE 
-    spdlog::spdlog
-    Threads::Threads
-)
-
-# 6. 编译目标 3：RaftLog 单元测试 (raft_log_test)
+# 8. 编译目标 4：RaftLog 单元测试 (raft_log_test)
 enable_testing()
 
-add_executable(raft_log_test          # 单元测试入口
-    raft/RaftLog.cpp           # 👈 仅引入 RaftLog.cpp，不引入 RaftNode / RaftCore
-    ${PROTOCOL_SOURCES}        # 引入 protocol (LogEntry 序列化依赖)
+add_executable(raft_log_test 
+    raft/RaftLog.cpp 
+    ${PROTOCOL_SOURCES}
 )
-
-target_include_directories(raft_log_test PRIVATE 
-    "${CMAKE_CURRENT_SOURCE_DIR}"
-    "${CMAKE_CURRENT_SOURCE_DIR}/protocol"
-    "${CMAKE_CURRENT_SOURCE_DIR}/raft"
-)
-
+target_include_directories(raft_log_test PRIVATE ${COMMON_INCLUDE_DIRS})
 target_link_libraries(raft_log_test PRIVATE 
     GTest::gtest
     GTest::gtest_main

@@ -55,6 +55,9 @@ int main(int argc, char* argv[]) {
     RaftDispatcher dispatcher;
     TcpServer client_service_server(&loop, "127.0.0.1", client_service_port);
 
+    // 外部业务门面启用 3 个 Sub-Reactor 工作线程并发处理长连接
+    client_service_server.SetThreadNum(3);
+
     std::vector<uint32_t> peer_ids;
     for (int i = 3; i < argc; ++i) {
         std::string arg = argv[i];

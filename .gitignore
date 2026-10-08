@@ -1,28 +1,33 @@
-# 编译产物
+# 构建输出
 build/
 build_raft/
+cmake-build-*/
 bin/
 *.o
 *.a
 *.so
 
-# 运行期节点存储盒子与物理数据
-node_*_storage/
-*.wal
-*.vlog
-*.sst
+# 可执行文件
+raft_node
+raft_client_cli
+raft_log_test
+seckill_demo
+clientmain
 
-# 混沌与压测临时产物
-out.perf
-out.folded
-raft_perf.svg
+# 运行时数据与落盘目录
+node_*_storage/
+data/
+kv_data/
+vlog_storage/
+*.wal
+*.sst
 *.log
+*.meta
+CURRENT
+MANIFEST-*
 
 # IDE 与系统文件
 .vscode/
 .idea/
-.DS_Store
-
+*.DS_Store
 compile_commands.json
-.cache/
-.clangd/compile_commands.json
